@@ -5,7 +5,8 @@ dependencies = [
     "numpy",
     "pytest",
     "pytest-cov",
-    "flake8"
+    "flake8",
+    "matplotlib"
 ]
 
 
