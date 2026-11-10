@@ -6,7 +6,7 @@ Runs every benchmark script in this folder one after the other.
     python benchmark/run_all.py            (full sizes, saves results.md)
     python benchmark/run_all.py --quick    (smaller sizes, a few seconds, nothing is saved)
 
-Covers metrics, optim, stats, rank, sort_search, utils and benchmarking.
+Covers metrics, optim, stats, rank, sort_search, utils, benchmarking and numcompute_stream.
 The output of a full run is written to benchmark/results.md.
 """
 
@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = ["bench_metrics_optim_stats.py", "bench_rank_sort_utils.py"]
+SCRIPTS = ["bench_metrics_optim_stats.py", "bench_rank_sort_utils.py", "bench_stream.py"]
 HEADER = (
     "# NumCompute benchmark results\n\n"
     "Produced by `python benchmark/run_all.py`. Both the timings and the speed-up ratios depend\n"
