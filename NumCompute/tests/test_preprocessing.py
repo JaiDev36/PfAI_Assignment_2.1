@@ -259,7 +259,7 @@ class TestMinMaxScaler:
         Y_transformed = preprocessor.transform(Y)
 
         np.testing.assert_array_almost_equal(Y_transformed, np.array([[0.5, 0.5], [0.0, 0.0]]),
-                                              decimal=6)
+                                             decimal=6)
 
     def test_basic_negative_feature_range(self):
         X = np.array([[1, 10], [3, 30]])
@@ -270,7 +270,7 @@ class TestMinMaxScaler:
         Y_transformed = preprocessor.transform(Y)
 
         np.testing.assert_array_almost_equal(Y_transformed, np.array([[0.0, 0.0], [-1.0, -1.0]]),
-                                              decimal=6)
+                                             decimal=6)
 
     def test_basic_outside_range(self):
         X = np.array([[1, 10], [3, 30]])

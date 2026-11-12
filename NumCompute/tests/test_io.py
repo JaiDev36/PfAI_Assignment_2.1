@@ -14,7 +14,7 @@ def test_blanks_become_fill_values(tmp_path):
     file = tmp_path / "test.csv"
     file.write_text("1,2\n"
                     "3, \n"
-                     ",4\n"
+                    ",4\n"
                     "5,6")
     result = io.load_csv(file, delimiter=',', missing='fill', fill_value=0)
 
@@ -51,7 +51,7 @@ def test_skip_ignores_fill_value(tmp_path):
     file = tmp_path / "test.csv"
     file.write_text("1,2\n"
                     "3, \n"
-                     ",4\n"
+                    ",4\n"
                     "5,6")
     result = io.load_csv(file, delimiter=',', missing='skip', fill_value=-1)
 

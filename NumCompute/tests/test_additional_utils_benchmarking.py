@@ -262,8 +262,11 @@ class TestCompareLoopVsVectorisedAdditional:
                 lambda: np.array([1.0, np.nan]))
 
     def test_comparison_respects_tolerance(self):
-        loop_func = lambda: np.array([1.0, 2.0])
-        vec_func = lambda: np.array([1.0 + 1e-10, 2.0])
+        def loop_func():
+            return np.array([1.0, 2.0])
+
+        def vec_func():
+            return np.array([1.0 + 1e-10, 2.0])
 
         # Small floating-point rounding differences should be acceptable.
         result = benchmarking.compare_loop_vs_vectorised(
