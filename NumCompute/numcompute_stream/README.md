@@ -38,7 +38,7 @@ Nothing from `numcompute` is copied. The new classes subclass or call it:
 | `StreamingImputer` | a `numcompute.pipeline.Transformer`; reuses `SimpleImputer` to validate `fill_value` |
 | `ColumnStats` | one `numcompute.stats.RunningStats` per feature |
 | `DecisionTree` | an `numcompute.pipeline.Estimator`; the split search sorts with `numcompute.sort_search.stable_sort` |
-| `StreamingPipeline` | a subclass of `numcompute.pipeline.Pipeline`; `fit`, `predict` and step checks are inherited |
+| `StreamingPipeline` | a subclass of `numcompute.pipeline.Pipeline`; `transform` and `predict` are inherited, `fit` is overridden so `y` only goes to steps that take it |
 | `StreamingMetrics` | `numcompute.metrics.confusion_matrix` and `accuracy` |
 | `load_labelled_csv`, `iter_chunks` | `numcompute.io.load_csv` and `numcompute.utils.batches` |
 | benchmarks | `numcompute.benchmarking` (`time_it`, `compare_loop_vs_vectorised`, `environment_info`) |
@@ -69,6 +69,14 @@ tests run against the streaming classes (`tests/test_stream_preprocessing.py`).
 | `fit(X, y=None)` | forget everything, then learn from `X` alone (on the same code path as `partial_fit`) |
 | `reset()` | forget everything; returns `self` |
 | `transform(X)` / `predict(X)` | use what has been learned so far |
+
+Any object with these methods can be a pipeline step; it does not have to come from this package
+or inherit from anything. `StreamingPipeline` gives `y` only to a `fit` or `partial_fit` whose
+signature has room for it, so a third-party transformer written as `partial_fit(X)` /
+`transform(X)` (or `fit(X)` / `transform(X)`) works without an adapter. In batch `fit`, a step
+without `fit` is reset and given `partial_fit`. This answers a limitation found in
+`numcompute.pipeline.Pipeline` during the Assignment 2.1 review (it passes `y` to every `fit`);
+the group's class is left unchanged.
 
 Conventions: `X` is always 2-D with shape `(n_samples, n_features)` (a 1-D array is an error, as in
 numcompute); `y` is 1-D; `axis=0` means down the rows, one result per feature; NaN in `X` means
@@ -113,7 +121,7 @@ the tree in groups, one comparison per node.
 ## Tests
 
 ```bash
-pytest tests/test_stream_*.py                       # the streaming tests (266)
+pytest tests/test_stream_*.py                       # the streaming tests (276)
 pytest --cov=numcompute_stream --cov-report=term-missing
 ```
 
@@ -123,8 +131,8 @@ pytest --cov=numcompute_stream --cov-report=term-missing
 brief, `max_features`, `StreamTrainer`, windowed quantiles and histograms, rolling and AUC metrics,
 the incremental one-hot encoder and the three plots). They cover the contract shared with numcompute, streaming
 equal to batch for any chunk size, loop equal to vectorised, when exactly the buffer triggers a
-retrain, concept drift, NaN, ties, constant columns, a new class mid-stream, bad input and every
-plot. The whole suite (numcompute's tests included) runs with warnings treated as errors.
+retrain, concept drift, NaN, ties, constant columns, a new class mid-stream, bad input, third-party
+pipeline steps that take no `y`, and every plot. The whole suite (numcompute's tests included) runs with warnings treated as errors.
 
 ## Benchmarks and demo
 
