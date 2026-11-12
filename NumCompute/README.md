@@ -8,6 +8,10 @@ numerical routines are written to stay accurate on very large and very small val
 It was written for COMP 5004, Assignment 2.1, Programming Task 1, by Edward Coombs, Jaidev
 Parthiban and Sai Siriza Gaddam.
 
+Assignment 2.2 extends the toolkit with `numcompute_stream`, streaming machine learning (a
+decision tree retrained from a buffer, running statistics and test-then-train evaluation) built on
+the modules below. See [numcompute_stream/README.md](./numcompute_stream/README.md).
+
 ## Project setup
 
 ### 1. Install Conda
@@ -191,6 +195,7 @@ pytest --cov=numcompute --cov-report=term-missing tests/
 
 `tests/` has a test file for each module, plus:
 
+- `test_stream_*.py`: the five test files of `numcompute_stream` (Assignment 2.2)
 - `test_integration.py`: io, pipeline, metrics, stats and rank used together
 - `test_review_fixes.py`: one regression test for each bug found in code review
 - `test_additional_utils_benchmarking.py`: extra edge cases for batching, activations and
@@ -207,6 +212,8 @@ and extreme magnitudes. GitHub Actions runs the test suite on every pull request
 | Quick benchmark run | `python benchmark/run_all.py --quick` (does not write a file) |
 | Check code style | `flake8` |
 | Open the demo | open `demo/quickstart.ipynb` in VS Code or Jupyter and run all cells |
+| Streaming benchmark (Assignment 2.2) | `python benchmark/bench_stream.py` (also part of `run_all.py`; output in `benchmark/results_stream.md`) |
+| Streaming demo (Assignment 2.2) | open `demo/stream_demo.ipynb` (data from `python data/make_stream_data.py`) |
 
 On Windows, use `py` in place of `python` if `python` is not found. Run every command from the `NumCompute` folder (the one that contains `numcompute/`, `tests/`, `benchmark/` and `demo/`).
 
