@@ -317,6 +317,139 @@ def test_prequential_keeps_adding_to_a_given_metrics_object(blobs):
 
 
 # ---------------------------------------------------------------------
+# Third-party steps (2.1 feedback: a fit(X)/transform(X) object should need no adapter)
+# ---------------------------------------------------------------------
+
+
+class ExternalCentre:
+    """A third-party streaming transformer: no base class, no fit, no y anywhere."""
+
+    def __init__(self):
+        self.total, self.count = 0.0, 0
+
+    def partial_fit(self, X):
+        self.total = self.total + np.nansum(X, axis=0)
+        self.count += X.shape[0]
+        return self
+
+    def transform(self, X):
+        return np.nan_to_num(X - self.total / self.count)
+
+
+class ExternalFitOnly(ExternalCentre):
+    """Also has a batch fit(X) with no y, the exact shape named in the feedback."""
+
+    def fit(self, X):
+        self.__init__()
+        return self.partial_fit(X)
+
+
+def test_pipeline_streams_through_a_third_party_transformer_without_y(blobs):
+    X, y = blobs
+    pipe = StreamingPipeline([("centre", ExternalCentre()),
+                              ("tree", DecisionTree(max_depth=4, buffer_size=100))])
+    by_hand_centre = ExternalCentre()
+    by_hand_tree = DecisionTree(max_depth=4, buffer_size=100)
+    for X_chunk, y_chunk in iter_chunks(X, y, 50):
+        pipe.partial_fit(X_chunk, y_chunk)
+        by_hand_tree.partial_fit(by_hand_centre.partial_fit(X_chunk).transform(X_chunk), y_chunk)
+    expected = by_hand_tree.predict(by_hand_centre.transform(X))
+    np.testing.assert_array_equal(pipe.predict(X), expected)
+    assert np.mean(pipe.predict(X) == y) > 0.9
+
+
+def test_pipeline_batch_fit_with_fit_x_only_and_partial_fit_only_transformers(blobs):
+    X, y = blobs
+    for step in (ExternalFitOnly(), ExternalCentre()):
+        pipe = StreamingPipeline([("centre", step), ("tree", DecisionTree(max_depth=4))])
+        assert pipe.fit(X, y) is pipe
+        assert step.count == X.shape[0]                  # learned from X exactly once
+        assert np.mean(pipe.predict(X) == y) > 0.97
+
+
+def test_fit_on_a_fit_x_only_step_forgets_earlier_data(blobs):
+    X, y = blobs
+    step = ExternalFitOnly()
+    pipe = StreamingPipeline([("centre", step), ("tree", DecisionTree(max_depth=4))])
+    pipe.partial_fit(X, y)
+    pipe.fit(X[:100], y[:100])
+    assert step.count == 100
+
+
+def test_pipeline_fit_transform_with_only_third_party_transformers(rng):
+    X = rng.normal(5.0, 1.0, (40, 3))
+    pipe = StreamingPipeline([("a", ExternalFitOnly()), ("b", ExternalCentre())])
+    out = pipe.fit_transform(X, rng.integers(0, 2, 40))
+    np.testing.assert_allclose(out.mean(axis=0), 0.0, atol=1e-12)
+    with pytest.raises(TypeError, match="must implement transform"):
+        StreamingPipeline([("a", ExternalCentre()),
+                           ("tree", DecisionTree())]).fit_transform(X, np.zeros(40))
+
+
+@pytest.mark.parametrize("signature", ["positional", "args", "keyword_only", "kwargs"])
+def test_steps_that_can_take_y_still_receive_it(blobs, signature):
+    X, y = blobs
+    seen = []
+
+    class Recorder:
+        def transform(self, X):
+            return X
+
+    def positional(self, X, y=None):
+        seen.append(y)
+        return self
+
+    def args(self, X, *extra):
+        seen.append(extra[0])
+        return self
+
+    def keyword_only(self, X, *, y=None):
+        seen.append(y)
+        return self
+
+    def kwargs(self, X, **extra):
+        seen.append(extra["y"])
+        return self
+
+    Recorder.partial_fit = {"positional": positional, "args": args,
+                            "keyword_only": keyword_only, "kwargs": kwargs}[signature]
+    pipe = StreamingPipeline([("rec", Recorder()), ("tree", DecisionTree(buffer_size=50))])
+    pipe.partial_fit(X[:50], y[:50])
+    np.testing.assert_array_equal(seen[0], y[:50])
+
+
+def test_a_third_party_step_without_transform_is_rejected_by_name():
+    class NoTransform:
+        def partial_fit(self, X):
+            return self
+
+    with pytest.raises(TypeError, match="'odd' must implement transform"):
+        StreamingPipeline([("odd", NoTransform()), ("tree", DecisionTree())])
+
+
+def test_a_third_party_step_with_an_unreadable_signature_gets_y(blobs):
+    X, y = blobs
+    seen = []
+
+    class Opaque:
+        __signature__ = "unreadable"          # inspect.signature raises ValueError on this
+
+        def __call__(self, *args):
+            seen.append(len(args))
+
+    class Step:
+        def __init__(self):
+            self.partial_fit = Opaque()
+
+        def transform(self, X):
+            return X
+
+    pipe = StreamingPipeline([("s", Step()), ("tree", DecisionTree(buffer_size=50))])
+    pipe.partial_fit(X[:50], y[:50])
+    assert seen == [2]                        # same as numcompute's Pipeline: X and y
+
+
+# ---------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------
 

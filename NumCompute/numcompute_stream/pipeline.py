@@ -11,8 +11,13 @@ Design note: transformer parameters keep moving as chunks arrive, so rows waitin
 buffer may have been transformed with slightly different parameters from later rows. A running-mean
 imputer is barely affected. A tree needs no scaling at all (a split x <= t only depends on the order
 of the values), so the usual pipeline is an imputer followed by the tree.
+
+Interoperability: a step does not have to come from this package or inherit from anything. y is
+passed only to a fit or partial_fit that can take it, so a third-party transformer written as
+partial_fit(X) / transform(X), or fit(X) / transform(X), works without an adapter.
 """
 
+import inspect
 import logging
 import time
 
@@ -24,15 +29,89 @@ from .metrics import StreamingMetrics
 logger = logging.getLogger("numcompute_stream")
 
 
+def _accepts_y(method):
+    """
+    Tell whether a fit or partial_fit method can be given the labels.
+
+    Parameters:
+    ----------
+    - method: a bound method, for example step.partial_fit
+
+    Returns:
+    -------
+    - "positional" if it can be called as method(X, y), "keyword" if only as method(X, y=y),
+    or None if it takes X alone
+
+    Note:
+    ----
+    - A method whose signature cannot be read (some built-ins) is assumed to take y, which is
+    what numcompute.pipeline.Pipeline always assumed.
+    """
+    try:
+        params = list(inspect.signature(method).parameters.values())
+    except (TypeError, ValueError):
+        return "positional"
+    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    if len(positional) >= 2 or any(p.kind == p.VAR_POSITIONAL for p in params):
+        return "positional"
+    if any(p.kind == p.VAR_KEYWORD or (p.kind == p.KEYWORD_ONLY and p.name == "y")
+           for p in params):
+        return "keyword"
+    return None
+
+
+def _call_with_optional_y(method, X, y):
+    """
+    Call method(X, y) if the method takes labels, otherwise method(X).
+
+    Parameters:
+    ----------
+    - method: a bound fit or partial_fit
+    - X: the data
+    - y: the labels (may be None)
+
+    Returns:
+    -------
+    - whatever the method returns
+    """
+    how = _accepts_y(method)
+    if how == "positional":
+        return method(X, y)
+    if how == "keyword":
+        return method(X, y=y)
+    return method(X)
+
+
+def _batch_fit(step, X, y):
+    """
+    Train one step on all of X: fit if it has one, otherwise reset (if it can) and partial_fit.
+
+    Parameters:
+    ----------
+    - step: a pipeline step
+    - X, y: the data and labels
+
+    Returns:
+    -------
+    - None
+    """
+    if hasattr(step, "fit"):
+        _call_with_optional_y(step.fit, X, y)
+    else:
+        if hasattr(step, "reset"):
+            step.reset()
+        _call_with_optional_y(step.partial_fit, X, y)
+
+
 class StreamingPipeline(Pipeline):
     """
     A numcompute Pipeline that can also learn one chunk at a time.
 
     Parameters:
     ----------
-    - steps: list of (name, object) tuples. Every transformer needs partial_fit(X) and
-    transform(X); the final step needs partial_fit(X, y) and predict(X). The rules of
-    numcompute.pipeline.Pipeline also apply (they are checked by its constructor).
+    - steps: list of (name, object) tuples. Every transformer needs partial_fit and transform;
+    the final step needs partial_fit(X, y) and predict(X). fit is optional: fit(X, y) falls back
+    to reset() and partial_fit for a step that has no fit.
 
     Attributes:
     ----------
@@ -42,7 +121,7 @@ class StreamingPipeline(Pipeline):
 
     Raises:
     ------
-    - TypeError: if a transformer has no partial_fit, or the final step has no partial_fit
+    - TypeError: if a step has no partial_fit, or a transformer has no transform
     - ValueError: if the step names are not unique
 
     Complexity:
@@ -52,7 +131,10 @@ class StreamingPipeline(Pipeline):
 
     Note:
     ----
-    - fit, transform and predict come from Pipeline unchanged, so batch use still works.
+    - transform and predict come from Pipeline unchanged. fit and fit_transform are overridden
+    only so that y goes to the steps that take it.
+    - y reaches a step's fit or partial_fit only if its signature has room for it (a second
+    positional parameter, *args, a keyword-only y or **kwargs); otherwise the step gets X alone.
     - update is a synonym of partial_fit.
     """
 
@@ -60,10 +142,15 @@ class StreamingPipeline(Pipeline):
         names = [name for name, _ in steps]
         if len(set(names)) != len(names):
             raise ValueError("Step names must be unique. Got: {}".format(names))
-        super().__init__(steps)
         for name, step in steps:
             if not hasattr(step, "partial_fit"):
                 raise TypeError("Pipeline step {!r} must implement partial_fit".format(name))
+        for name, step in steps[:-1]:
+            if not hasattr(step, "transform"):
+                raise TypeError("Pipeline step {!r} must implement transform".format(name))
+        # Pipeline.__init__ is not called: it would also demand fit on every transformer, which
+        # a streaming-only transformer need not have. It only stores and checks the steps.
+        self.steps = steps
 
     @property
     def named_steps(self):
@@ -94,12 +181,58 @@ class StreamingPipeline(Pipeline):
         """
         X, y = check_X_y(X, y)
         for _, step in self.steps[:-1]:
-            step.partial_fit(X, y)
+            _call_with_optional_y(step.partial_fit, X, y)
             X = step.transform(X)
         self.model.partial_fit(X, y)
         return self
 
     update = partial_fit
+
+    def fit(self, X, y=None):
+        """
+        Batch training: every transformer learns from all of X and transforms it, then the model
+        is fitted on the result.
+
+        Parameters:
+        ----------
+        - X: array-like of shape (n_samples, n_features)
+        - y: array-like of shape (n_samples,), given to the steps that take it (default None)
+
+        Returns:
+        -------
+        - self
+        """
+        if not self.steps:
+            return self
+        for _, step in self.steps[:-1]:
+            _batch_fit(step, X, y)
+            X = step.transform(X)
+        _batch_fit(self.model, X, y)
+        return self
+
+    def fit_transform(self, X, y=None):
+        """
+        Fit every step on X in turn and return the output of the last one's transform.
+
+        Parameters:
+        ----------
+        - X: array-like of shape (n_samples, n_features)
+        - y: array-like of shape (n_samples,), given to the steps that take it (default None)
+
+        Returns:
+        -------
+        - X_out: output of the final step's transform
+
+        Raises:
+        ------
+        - TypeError: if the final step has no transform
+        """
+        for name, step in self.steps:
+            if not hasattr(step, "transform"):
+                raise TypeError("Pipeline step {!r} must implement transform".format(name))
+            _batch_fit(step, X, y)
+            X = step.transform(X)
+        return X
 
     def flush(self):
         """
