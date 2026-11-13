@@ -600,3 +600,113 @@ def test_an_empty_first_chunk_leaves_the_pipeline_untrained():
     pipe = StreamingPipeline([("imp", StreamingImputer()), ("tree", DecisionTree(buffer_size=8))])
     pipe.partial_fit(_EMPTY_X, _EMPTY_Y)
     assert not pipe.model.is_fitted and pipe.model.n_buffered_ == 0
+
+
+# ---------------------------------------------------------------------
+# Second review: StreamTrainer with empty chunks, fixed one-hot categories, AUC labels and
+# columns, histogram and AUC ranges at the float limit
+# ---------------------------------------------------------------------
+
+def test_stream_trainer_scores_an_empty_chunk_as_none_before_any_score(blobs):
+    X, y = blobs
+    trainer = StreamTrainer(DecisionTree(buffer_size=50), log_every=0).fit_chunk(X[:50], y[:50])
+    assert trainer.score_chunk(X[:0], y[:0]) is None
+    assert trainer.metrics.history["chunk"] == []
+
+
+def test_stream_trainer_does_not_repeat_the_last_accuracy_for_an_empty_chunk(blobs):
+    X, y = blobs
+    trainer = StreamTrainer(DecisionTree(buffer_size=50), log_every=0).fit_chunk(X[:50], y[:50])
+    trainer.score_chunk(X[50:100], y[50:100])
+    assert trainer.score_chunk(X[:0], y[:0]) is None
+    assert len(trainer.metrics.history["chunk"]) == 1
+
+
+def test_stream_trainer_run_skips_empty_chunks(blobs):
+    X, y = blobs
+    chunks = [(X[:50], y[:50]), (X[:0], y[:0]), (X[50:100], y[50:100])]
+    with_empty = StreamTrainer(DecisionTree(buffer_size=50), log_every=0).run(chunks)
+    without = StreamTrainer(DecisionTree(buffer_size=50), log_every=0).run(chunks[::2])
+    assert len(with_empty.log_) == len(without.log_) == 2
+    assert with_empty.cumulative_accuracy == without.cumulative_accuracy
+
+
+def test_one_hot_with_fixed_categories_keeps_its_width_and_rejects_others():
+    enc = StreamingOneHotEncoder(categories=[[0, 1, 2]])
+    assert enc.partial_fit([[1.0], [2.0]]).transform([[0.0]]).tolist() == [[1.0, 0.0, 0.0]]
+    with pytest.raises(ValueError, match="does not know"):
+        enc.partial_fit([[5.0]])
+    assert len(enc.categories_[0]) == 3
+    with pytest.raises(ValueError, match="does not know"):
+        StreamingOneHotEncoder(categories=[["a", "b"]]).fit([["c"]])
+
+
+def test_one_hot_handle_unknown_error_rejects_a_new_category_before_changing_state():
+    enc = StreamingOneHotEncoder(handle_unknown="error").partial_fit([[1.0], [2.0]])
+    with pytest.raises(ValueError, match="does not know"):
+        enc.partial_fit([[0.0], [1.0]])
+    assert enc.categories_[0].tolist() == [1.0, 2.0]
+    with pytest.raises(ValueError, match="handle_unknown"):
+        StreamingOneHotEncoder(handle_unknown="ignore")
+
+
+def test_one_hot_with_fixed_categories_works_in_front_of_a_tree():
+    X = np.array([[1.0], [2.0], [1.0], [2.0]])
+    pipe = StreamingPipeline([("onehot", StreamingOneHotEncoder(categories=[[0.0, 1.0, 2.0]])),
+                              ("tree", DecisionTree(buffer_size=4))])
+    pipe.partial_fit(X, [0, 1, 0, 1])
+    pipe.partial_fit([[0.0], [1.0]], [0, 0])           # a category not seen before: no new column
+    assert pipe.predict(X).tolist() == [0, 1, 0, 1]
+
+
+def test_expanding_one_hot_in_front_of_a_tree_fails_at_the_tree():
+    """The documented limit: without fixed categories, a new category widens the input."""
+    pipe = StreamingPipeline([("onehot", StreamingOneHotEncoder()),
+                              ("tree", DecisionTree(buffer_size=4))])
+    pipe.partial_fit([[1.0], [2.0], [1.0], [2.0]], [0, 1, 0, 1])
+    with pytest.raises(ValueError, match="feature"):
+        pipe.partial_fit([[0.0], [1.0]], [0, 0])
+
+
+@pytest.mark.parametrize("labels", [[1, np.nan], np.array([1, None], dtype=object)])
+def test_streaming_auc_rejects_missing_labels(labels):
+    with pytest.raises(ValueError, match="missing labels"):
+        StreamingAUC().update(labels, [0.9, 0.1])
+
+
+def test_streaming_auc_column_must_follow_classes_order():
+    X = np.array([[0.0], [1.0], [2.0], [3.0]])
+    y = np.array([1, 1, 0, 0])                            # label 1 is seen first
+    tree = DecisionTree(buffer_size=4).partial_fit(X, y)
+    assert tree.classes_.tolist() == [1, 0]
+    proba = tree.predict_proba(X)
+    right = proba[:, list(tree.classes_).index(1)]
+    assert StreamingAUC(pos_label=1).update(y, right).result() == 1.0
+    assert StreamingAUC(pos_label=1).update(y, proba[:, 1]).result() == 0.0   # the trap
+
+
+def test_streaming_auc_with_a_score_range_near_the_float_limit():
+    auc = StreamingAUC(score_range=(-1e308, 1e308)).update([0, 1], [-1e307, 1e307])
+    assert auc.result() == 1.0
+
+
+def test_histogram_of_a_constant_huge_value_gets_a_real_range():
+    hist = StreamingHistogram(bins=4).update(np.full((5, 1), 1e20))
+    lo, hi = hist.edges_[0, 0], hist.edges_[0, -1]
+    assert lo < 1e20 < hi and hist.counts_.sum() == 5 and hist.n_outside_ == 0
+
+
+def test_histogram_with_a_range_near_the_float_limit():
+    hist = StreamingHistogram(bins=4, value_range=(-1e308, 1e308))
+    hist.update(np.array([[-1e308], [-1.0], [1e307], [1e308]]))
+    np.testing.assert_array_equal(hist.counts_[0], [1, 1, 1, 1])
+    np.testing.assert_array_equal(hist.edges_[0], [-1e308, -5e307, 0.0, 5e307, 1e308])
+
+
+def test_histogram_ordinary_range_is_unchanged_by_the_scaling(rng):
+    x = rng.normal(size=(500, 1))
+    ours = StreamingHistogram(bins=7, value_range=(-3.0, 3.0)).update(x)
+    from numcompute.stats import histogram
+    counts, edges = histogram(x[(x >= -3) & (x <= 3)], bins=7, value_range=(-3.0, 3.0))
+    np.testing.assert_array_equal(ours.counts_[0], counts)
+    np.testing.assert_array_equal(ours.edges_[0], edges)

@@ -266,6 +266,15 @@ class StreamingMetrics:
         return np.asarray(self.history[key], dtype=np.float64)
 
 
+def _has_missing(labels):
+    """True if a 1-D label array holds NaN (float arrays) or None/NaN (object arrays)."""
+    if labels.dtype.kind == "f":
+        return bool(np.isnan(labels).any())
+    if labels.dtype.kind == "O":
+        return any(v is None or (isinstance(v, float) and v != v) for v in labels)
+    return False
+
+
 class StreamingAUC:
     """
     Binary ROC AUC accumulated over a stream, from score histograms.
@@ -293,13 +302,19 @@ class StreamingAUC:
     Note:
     ----
     - AUC is the probability that a random positive scores above a random negative (ties count
-    one half). A stream cannot keep every score, so each class keeps a histogram of its scores
-    and the AUC is read from the two histograms. Scores that share a bin count as tied, so the
+    one half). A stream cannot keep every score, so two histograms are kept, one of the scores of
+    positive samples (y_true == pos_label) and one of all the others, and the AUC is read from
+    them. It is binary AUC: with more than two classes, everything that is not pos_label counts
+    as negative (one-versus-rest). Scores that share a bin count as tied, so the
     value is an approximation: a positive and a negative that fall in the same bin count as
     half a win however their scores compare. It equals numcompute.metrics.auc when no bin holds
     both a positive and a negative score, and it approaches it as n_bins grows.
-    - update(y_true, y_score) takes the chunk's labels and the model's score for the positive
-    class (for example DecisionTree.predict_proba(X)[:, 1]).
+    - update(y_true, y_score) takes the chunk's labels and the model's score for pos_label. For a
+    DecisionTree that is the column of pos_label in classes_, which is not always column 1,
+    because the tree keeps classes in the order it first saw them:
+    proba[:, list(tree.classes_).index(pos_label)].
+    - The bin of a score is worked out with halved values, so score_range can be as wide as
+    (-1.8e308, 1.8e308) without overflow.
 
     Examples:
     --------
@@ -361,8 +376,8 @@ class StreamingAUC:
 
         Raises:
         ------
-        - ValueError: if the inputs are not 1-dimensional of the same length, or a score is NaN
-        or outside score_range
+        - ValueError: if the inputs are not 1-dimensional of the same length, a label is missing
+        (NaN or None), or a score is NaN or outside score_range
         """
         y_true = np.asarray(y_true)
         y_score = np.asarray(y_score, dtype=np.float64)
@@ -374,12 +389,16 @@ class StreamingAUC:
                              .format(y_true.size, y_score.size))
         if y_true.size == 0:
             return self
+        if _has_missing(y_true):
+            raise ValueError("y_true must not contain missing labels (NaN or None); a missing "
+                             "label cannot be counted as positive or negative.")
         low, high = self.score_range
         if np.isnan(y_score).any() or (y_score < low).any() or (y_score > high).any():
             raise ValueError("y_score must be numbers inside score_range {}. Found NaN or "
                              "values outside it.".format(self.score_range))
-        bins = np.minimum(((y_score - low) / (high - low) * self.n_bins).astype(np.intp),
-                          self.n_bins - 1)
+        # halved first, so y_score - low and high - low cannot overflow for a range near 1e308
+        fraction = (y_score / 2.0 - low / 2.0) / (high / 2.0 - low / 2.0)
+        bins = np.minimum((fraction * self.n_bins).astype(np.intp), self.n_bins - 1)
         positive = y_true == self.pos_label
         pos = np.bincount(bins[positive], minlength=self.n_bins)
         neg = np.bincount(bins[~positive], minlength=self.n_bins)

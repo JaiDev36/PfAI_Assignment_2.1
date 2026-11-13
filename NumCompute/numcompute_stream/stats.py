@@ -392,6 +392,23 @@ class StreamingQuantiles:
         return self.quantile(0.5)
 
 
+def _range_scale(lo, hi):
+    """1.0, or 0.5 when hi - lo would overflow (a range such as (-1e308, 1e308))."""
+    return 1.0 if hi / 2.0 - lo / 2.0 < np.finfo(np.float64).max / 2.0 else 0.5
+
+
+def _widen(value):
+    """
+    A range of non-zero width around a constant value.
+
+    +-0.5 is used for ordinary values. A value as large as 1e20 is unchanged by adding 0.5, so the
+    half-width grows with the value (about 1e-9 of it), and it is kept inside the float range.
+    """
+    half = max(0.5, abs(value) * 1e-9)
+    biggest = np.finfo(np.float64).max
+    return max(value - half, -biggest), min(value + half, biggest)
+
+
 class StreamingHistogram:
     """
     Per-feature histograms over a stream, with fixed bins and an optional sliding window.
@@ -426,6 +443,10 @@ class StreamingHistogram:
     ----
     - Keeping the bin edges fixed is what makes the counts of different chunks addable. Each
     chunk is counted with numcompute.stats.histogram.
+    - A feature that is constant in the first chunk gets a range of +-0.5 around its value, or
+    wider for a value so large (such as 1e20) that adding 0.5 would not change it.
+    - A range as wide as (-1e308, 1e308) works: the bins are computed on halved values, so
+    nothing overflows.
     - NaN is ignored.
     - With a window, the oldest chunk's counts are subtracted when a new chunk pushes it out.
     """
@@ -495,7 +516,11 @@ class StreamingHistogram:
             inside = col[(col >= lo) & (col <= hi)]
             outside += col.size - inside.size
             if inside.size:
-                counts[j] = histogram(inside, bins=self.bins, value_range=(lo, hi))[0]
+                # numcompute.stats.histogram works out (x - low) / (high - low); for a range
+                # wider than the largest float it is given halved values (the same bins, exactly)
+                scale = _range_scale(lo, hi)
+                counts[j] = histogram(inside * scale, bins=self.bins,
+                                      value_range=(lo * scale, hi * scale))[0]
         self.counts_ = counts if self.counts_ is None else self.counts_ + counts
         self.n_outside_ += outside
         if self.window is not None:
@@ -523,6 +548,7 @@ class StreamingHistogram:
                                      "range from; pass value_range.".format(j))
                 lo, hi = float(col.min()), float(col.max())
                 if lo == hi:
-                    lo, hi = lo - 0.5, hi + 0.5
-            edges[j] = np.linspace(lo, hi, self.bins + 1)
+                    lo, hi = _widen(lo)
+            scale = _range_scale(lo, hi)
+            edges[j] = np.linspace(lo * scale, hi * scale, self.bins + 1) / scale
         self.edges_ = edges

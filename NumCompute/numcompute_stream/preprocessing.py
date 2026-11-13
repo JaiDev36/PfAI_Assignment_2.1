@@ -12,12 +12,13 @@ API, on top of numcompute's fit(X, y=None), transform(X) and fit_transform(X, y=
 - reset() -> self                  forgets everything
 
 fit is reset followed by partial_fit on the whole input, so batch and streaming learning share one
-code path. The scalers inherit transform from numcompute, so they keep its checks, its error
-messages and its protection against overflow near 1e308.
+code path. The scalers inherit transform from numcompute, so they keep its checks and its error
+messages.
 
-StreamingOneHotEncoder expands its categories as new ones arrive. The number of output columns
-therefore grows during a stream, so put it before a model only when every category is known in
-advance (one chunk that holds them all) or when the model can accept a changing width.
+StreamingOneHotEncoder expands its categories as new ones arrive, so by default the number of
+output columns can grow during a stream. A model such as DecisionTree needs a fixed width, so in
+front of one, give the encoder its categories (categories=[...]) or use handle_unknown="error":
+an unknown category is then rejected at the encoder before anything changes.
 """
 
 import numpy as np
@@ -61,8 +62,10 @@ class StreamingStandardScaler(StandardScaler):
     - fit behaves like StandardScaler.fit and raises on an empty array or an all-NaN column.
     partial_fit is more forgiving: an empty chunk changes nothing, and a chunk where one column is
     all NaN is fine, because that column may be observed in a later chunk.
-    - The standard deviation comes from Welford's parallel update, which is exact for ordinary
-    data but, unlike StandardScaler.fit, is not protected against overflow for values near 1e308.
+    - The mean and standard deviation come from ColumnStats (Welford's parallel update, scaled
+    for values above 2**400), so learning does not overflow even for values near 1e308. The
+    inherited transform computes x - mean, which can still overflow when a value is more than
+    1.8e308 from the mean, as in numcompute's StandardScaler.
     - Parameters change as chunks arrive, so the same row transforms differently before and after
     a partial_fit. Scale a chunk with the parameters learned so far, which is what a deployed
     streaming pipeline can do.
@@ -539,16 +542,26 @@ class LabelEncoder:
 
 class StreamingOneHotEncoder(OneHotEncoder):
     """
-    One-hot encoder whose categories grow as new ones appear in later chunks.
+    One-hot encoder whose categories can grow as new ones appear in later chunks, or stay fixed.
+
+    Parameters:
+    ----------
+    - categories: None, or a list with one list of allowed values per feature. When given, the
+    output columns are fixed from the start and a value outside the list is an error.
+    - handle_unknown: "expand" (default) or "error". With "expand" a new category adds a column.
+    With "error" the categories of the first non-empty chunk are kept, and a later chunk with a
+    new category raises ValueError before anything changes. Ignored when categories is given
+    (the list is then always fixed).
 
     Attributes:
     ----------
-    - categories_: list of arrays, the sorted categories of each feature seen so far (NaN last)
+    - categories_: list of arrays, the sorted categories of each feature (NaN last)
 
     Raises:
     ------
-    - ValueError: if X is not 2-dimensional, has a different number of features from earlier
-    chunks, or (in transform) holds a category no chunk has shown yet
+    - ValueError: if handle_unknown is not "expand" or "error", if X is not 2-dimensional or has
+    a different number of features from earlier chunks, if a fixed encoder meets a category it
+    does not know, or (in transform) if X holds a category no chunk has shown yet
     - TypeError: if a column mixes strings and numbers
 
     Complexity:
@@ -560,8 +573,11 @@ class StreamingOneHotEncoder(OneHotEncoder):
     ----
     - A subclass of numcompute.preprocessing.OneHotEncoder, so transform and its checks are
     inherited. partial_fit merges the chunk's categories into the known ones.
-    - The categories stay sorted, so a new category can land between old ones and move the later
-    columns of the output. The width of the output only ever grows.
+    - The categories stay sorted, so with "expand" a new category can land between old ones and
+    move the later columns of the output, and the width of the output grows. A model after the
+    encoder (such as DecisionTree) needs a fixed number of features and rejects the wider
+    output. In a pipeline with a tree, give categories or use handle_unknown="error", so the
+    stream fails at the encoder, with nothing changed, instead of at the tree.
     - A chunk is registered by partial_fit before it is transformed, so the usual order
     (partial_fit, then transform) never meets an unseen category. fit forgets everything first.
     - An empty chunk changes nothing.
@@ -573,13 +589,22 @@ class StreamingOneHotEncoder(OneHotEncoder):
     [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
     """
 
-    def __init__(self):
+    def __init__(self, categories=None, handle_unknown="expand"):
         super().__init__()
+        if handle_unknown not in ("expand", "error"):
+            raise ValueError('handle_unknown must be "expand" or "error". Got: {!r}'
+                             .format(handle_unknown))
+        self.categories = categories
+        self.handle_unknown = handle_unknown
         self.reset()
+
+    @property
+    def _fixed(self):
+        return self.categories is not None or self.handle_unknown == "error"
 
     def reset(self):
         """
-        Forget every category.
+        Forget every category learned from data (a categories list given to the constructor stays).
 
         Returns:
         -------
@@ -587,7 +612,25 @@ class StreamingOneHotEncoder(OneHotEncoder):
         """
         if hasattr(self, "categories_"):
             del self.categories_
+        if self.categories is not None:
+            self.categories_ = [self._unique(self._as_array([[v] for v in values])[:, 0])
+                                for values in self.categories]
         return self
+
+    def _merged(self, X):
+        """The categories after adding X, or ValueError if a fixed encoder meets a new one."""
+        if X.shape[1] != len(self.categories_):
+            raise ValueError("Incompatible dimensionality. Expected {} features, got {}."
+                             .format(len(self.categories_), X.shape[1]))
+        merged = [self._unique(np.concatenate([known, X[:, i]]))
+                  for i, known in enumerate(self.categories_)]
+        if self._fixed:
+            for i, (known, new) in enumerate(zip(self.categories_, merged)):
+                if len(new) != len(known):
+                    raise ValueError("Feature {} has a category the encoder does not know, and "
+                                     "its categories are fixed (categories given or "
+                                     "handle_unknown='error').".format(i))
+        return merged
 
     def partial_fit(self, X, y=None):
         """
@@ -610,11 +653,7 @@ class StreamingOneHotEncoder(OneHotEncoder):
         if not hasattr(self, "categories_"):
             self.categories_ = [self._unique(X[:, i]) for i in range(X.shape[1])]
             return self
-        if X.shape[1] != len(self.categories_):
-            raise ValueError("Incompatible dimensionality. Expected {} features, got {}."
-                             .format(len(self.categories_), X.shape[1]))
-        self.categories_ = [self._unique(np.concatenate([known, X[:, i]]))
-                            for i, known in enumerate(self.categories_)]
+        self.categories_ = self._merged(X)      # checked in full before anything is stored
         return self
 
     update = partial_fit
@@ -634,10 +673,17 @@ class StreamingOneHotEncoder(OneHotEncoder):
 
         Raises:
         ------
-        - ValueError: if X is empty or not 2-dimensional
+        - ValueError: if X is empty or not 2-dimensional, or holds a category outside a given
+        categories list
         """
         self.reset()
-        return super().fit(X, y)
+        if self.categories is None:
+            return super().fit(X, y)
+        fixed = self.categories_
+        super().fit(X, y)                       # the inherited checks of X
+        self.categories_ = fixed
+        self._merged(self._as_array(X))         # raises if X is outside the list
+        return self
 
 
 # The names the assignment brief uses.
