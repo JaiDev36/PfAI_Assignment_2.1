@@ -59,7 +59,7 @@ def test_streaming_metrics_string_labels_series_and_reset():
 
 @pytest.mark.parametrize("y_true, y_pred, message", [
     ([0, 1], [0], "same length"),
-    ([], [], "must not be empty"),
+    ([], [0], "same length"),                              # empty against non-empty is an error
     ([[0, 1]], [[0, 1]], "1-dimensional"),
     ([0.0, np.nan], [0.0, 1.0], "NaN"),
 ])
@@ -68,6 +68,34 @@ def test_streaming_metrics_reject_bad_input(y_true, y_pred, message):
     with pytest.raises(ValueError, match=message):
         stream.update(y_true, y_pred)
     assert stream.history["chunk"] == []                   # a failed update recorded nothing
+
+
+def test_streaming_metrics_ignore_an_empty_update():
+    stream = StreamingMetrics(window=2).update([0, 1, 1], [0, 1, 0])
+    before = (stream.last_entry_, len(stream.history["chunk"]), stream.confusion_.copy())
+    assert stream.update([], []) is stream
+    assert stream.last_entry_ is before[0]
+    assert len(stream.history["chunk"]) == before[1]
+    np.testing.assert_array_equal(stream.confusion_, before[2])
+
+
+def test_rolling_window_keeps_its_own_copy_of_each_chunk():
+    y_true, y_pred = np.array([0, 1, 1]), np.array([0, 1, 0])
+    stream = StreamingMetrics(window=3).update(y_true, y_pred)
+    expected = stream.result()["rolling_accuracy"]
+    y_true[:] = 0                                         # the caller reuses its arrays
+    y_pred[:] = 1
+    assert stream.result()["rolling_accuracy"] == expected
+
+
+def test_prequential_skips_an_empty_chunk(blobs):
+    X, y = blobs
+    chunks = list(iter_chunks(X, y, 50))
+    with_empty = chunks[:2] + [(X[:0], y[:0])] + chunks[2:]
+    a = prequential_run(DecisionTree(buffer_size=60), iter(chunks), log_every=0)
+    b = prequential_run(DecisionTree(buffer_size=60), iter(with_empty), log_every=0)
+    np.testing.assert_array_equal(a.series("chunk_accuracy"), b.series("chunk_accuracy"))
+    assert list(b.series("rows_read")) == list(a.series("rows_read"))
 
 
 def test_per_class_scores_handle_zero_division():
@@ -336,12 +364,44 @@ class ExternalCentre:
         return np.nan_to_num(X - self.total / self.count)
 
 
-class ExternalFitOnly(ExternalCentre):
-    """Also has a batch fit(X) with no y, the exact shape named in the feedback."""
+class ExternalWithReset(ExternalCentre):
+    """Adds reset(), so a batch fit can start it from nothing."""
+
+    def reset(self):
+        self.__init__()
+        return self
+
+
+class ExternalFitAndStream:
+    """Independent fit(X) (no y) and partial_fit(X): nothing is inherited, calls are recorded."""
+
+    def __init__(self):
+        self.calls, self.total, self.count = [], 0.0, 0
 
     def fit(self, X):
-        self.__init__()
-        return self.partial_fit(X)
+        self.calls.append("fit")
+        self.total, self.count = np.nansum(X, axis=0), X.shape[0]      # replaces earlier state
+        return self
+
+    def partial_fit(self, X):
+        self.calls.append("partial_fit")
+        self.total = self.total + np.nansum(X, axis=0)
+        self.count += X.shape[0]
+        return self
+
+    def transform(self, X):
+        return np.nan_to_num(X - self.total / self.count)
+
+
+class ExternalFitOnly:
+    """The shape named in the 2.1 feedback: fit(X) and transform(X), and nothing to stream with."""
+
+    def fit(self, X):
+        self.mean_ = np.nanmean(X, axis=0)
+        return self
+
+    def transform(self, X):
+        return X - self.mean_
 
 
 def test_pipeline_streams_through_a_third_party_transformer_without_y(blobs):
@@ -358,32 +418,74 @@ def test_pipeline_streams_through_a_third_party_transformer_without_y(blobs):
     assert np.mean(pipe.predict(X) == y) > 0.9
 
 
-def test_pipeline_batch_fit_with_fit_x_only_and_partial_fit_only_transformers(blobs):
+def test_pipeline_batch_fit_uses_a_steps_own_fit_and_forgets_earlier_data(blobs):
     X, y = blobs
-    for step in (ExternalFitOnly(), ExternalCentre()):
-        pipe = StreamingPipeline([("centre", step), ("tree", DecisionTree(max_depth=4))])
-        assert pipe.fit(X, y) is pipe
-        assert step.count == X.shape[0]                  # learned from X exactly once
-        assert np.mean(pipe.predict(X) == y) > 0.97
+    step = ExternalFitAndStream()
+    pipe = StreamingPipeline([("centre", step), ("tree", DecisionTree(max_depth=4))])
+    pipe.partial_fit(X, y)
+    assert pipe.fit(X[:100], y[:100]) is pipe
+    assert step.calls == ["partial_fit", "fit"]            # fit, not partial_fit, for the batch
+    assert step.count == 100                               # and the earlier chunk is forgotten
+    assert np.mean(pipe.predict(X[:100]) == y[:100]) > 0.95
 
 
-def test_fit_on_a_fit_x_only_step_forgets_earlier_data(blobs):
+def test_pipeline_batch_fit_resets_then_streams_a_step_with_no_fit(blobs):
     X, y = blobs
-    step = ExternalFitOnly()
+    step = ExternalWithReset()
     pipe = StreamingPipeline([("centre", step), ("tree", DecisionTree(max_depth=4))])
     pipe.partial_fit(X, y)
     pipe.fit(X[:100], y[:100])
     assert step.count == 100
 
 
-def test_pipeline_fit_transform_with_only_third_party_transformers(rng):
+def test_pipeline_batch_fit_rejects_a_step_with_neither_fit_nor_reset(blobs):
+    X, y = blobs
+    step = ExternalCentre()
+    pipe = StreamingPipeline([("centre", step), ("tree", DecisionTree())])
+    pipe.partial_fit(X, y)
+    with pytest.raises(TypeError, match="neither fit nor reset"):
+        pipe.fit(X, y)
+    assert step.count == X.shape[0]                        # nothing was silently added to
+
+
+def test_pipeline_rejects_a_fit_only_transformer_and_says_why():
+    with pytest.raises(TypeError, match="partial_fit.*one chunk at a time"):
+        StreamingPipeline([("fit_only", ExternalFitOnly()), ("tree", DecisionTree())])
+
+
+def test_pipeline_fit_transform_with_third_party_transformers(rng):
     X = rng.normal(5.0, 1.0, (40, 3))
-    pipe = StreamingPipeline([("a", ExternalFitOnly()), ("b", ExternalCentre())])
+    pipe = StreamingPipeline([("a", ExternalFitAndStream()), ("b", ExternalWithReset())])
     out = pipe.fit_transform(X, rng.integers(0, 2, 40))
     np.testing.assert_allclose(out.mean(axis=0), 0.0, atol=1e-12)
     with pytest.raises(TypeError, match="must implement transform"):
-        StreamingPipeline([("a", ExternalCentre()),
+        StreamingPipeline([("a", ExternalWithReset()),
                            ("tree", DecisionTree())]).fit_transform(X, np.zeros(40))
+
+
+def test_pipeline_reset_clears_every_step(blobs):
+    X, y = blobs
+    pipe = StreamingPipeline([("imp", StreamingImputer()), ("tree", DecisionTree(buffer_size=60))])
+    for chunk, labels in iter_chunks(X, y, 50):
+        pipe.partial_fit(chunk, labels)
+    assert pipe.model.is_fitted
+    assert pipe.reset() is pipe
+    assert not pipe.model.is_fitted and pipe.model.n_buffered_ == 0
+    first = StreamingPipeline([("imp", StreamingImputer()), ("tree", DecisionTree(buffer_size=60))])
+    for chunk, labels in iter_chunks(X, y, 50):
+        pipe.partial_fit(chunk, labels)
+        first.partial_fit(chunk, labels)
+    np.testing.assert_array_equal(pipe.predict(X), first.predict(X))     # as good as new
+
+
+def test_pipeline_reset_is_all_or_nothing(blobs):
+    X, y = blobs
+    kept = ExternalWithReset()
+    pipe = StreamingPipeline([("a", kept), ("b", ExternalCentre()), ("tree", DecisionTree())])
+    pipe.partial_fit(X, y)
+    with pytest.raises(TypeError, match="'b' has no reset"):
+        pipe.reset()
+    assert kept.count == X.shape[0]                        # the first step was not reset either
 
 
 @pytest.mark.parametrize("signature", ["positional", "args", "keyword_only", "kwargs"])

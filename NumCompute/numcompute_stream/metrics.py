@@ -135,16 +135,25 @@ class StreamingMetrics:
 
         Raises:
         ------
-        - ValueError: if the inputs are not 1-dimensional, differ in length, are empty or contain
-        NaN (the checks of numcompute.metrics)
+        - ValueError: if the inputs are not 1-dimensional, differ in length or contain NaN (the
+        checks of numcompute.metrics)
 
         Complexity:
         ----------
         - Time complexity: O(n log k + k^2)
         - Space complexity: O(n + k^2)
+
+        Note:
+        ----
+        - Two empty inputs (a chunk with no rows) change nothing: no history entry is added and
+        last_entry_ stays as it was. An empty array against a non-empty one is still an error.
+        - With a window the chunk is stored as a copy, so changing the caller's arrays afterwards
+        does not change the rolling scores.
         """
         y_true = np.asarray(y_true)
         y_pred = np.asarray(y_pred)
+        if y_true.ndim == 1 and y_pred.ndim == 1 and y_true.size == 0 and y_pred.size == 0:
+            return self
         chunk_accuracy = accuracy(y_true, y_pred)        # validates both inputs first
         self._grow(np.unique(np.concatenate([y_true, y_pred])))
         self.confusion_ += confusion_matrix(y_true, y_pred, labels=self.labels_)
@@ -160,7 +169,7 @@ class StreamingMetrics:
             "macro_f1": float(per_class_scores(self.confusion_)[2].mean()),
         }
         if self.window is not None:
-            self._recent.append((y_true, y_pred))
+            self._recent.append((y_true.copy(), y_pred.copy()))
             entry["rolling_accuracy"] = self._window_scores()["accuracy"]
         entry.update(extra)
         for key, value in entry.items():
@@ -286,7 +295,9 @@ class StreamingAUC:
     - AUC is the probability that a random positive scores above a random negative (ties count
     one half). A stream cannot keep every score, so each class keeps a histogram of its scores
     and the AUC is read from the two histograms. Scores that share a bin count as tied, so the
-    value is exact up to that resolution and matches numcompute.metrics.auc as n_bins grows.
+    value is an approximation: a positive and a negative that fall in the same bin count as
+    half a win however their scores compare. It equals numcompute.metrics.auc when no bin holds
+    both a positive and a negative score, and it approaches it as n_bins grows.
     - update(y_true, y_score) takes the chunk's labels and the model's score for the positive
     class (for example DecisionTree.predict_proba(X)[:, 1]).
 

@@ -14,7 +14,9 @@ of the values), so the usual pipeline is an imputer followed by the tree.
 
 Interoperability: a step does not have to come from this package or inherit from anything. y is
 passed only to a fit or partial_fit that can take it, so a third-party transformer written as
-partial_fit(X) / transform(X), or fit(X) / transform(X), works without an adapter.
+partial_fit(X) / transform(X) works without an adapter. Every step must have partial_fit, because
+that is how a stream is learned; an object with only fit(X) / transform(X) cannot learn one chunk
+at a time and is rejected with a TypeError that says so.
 """
 
 import inspect
@@ -82,25 +84,33 @@ def _call_with_optional_y(method, X, y):
     return method(X)
 
 
-def _batch_fit(step, X, y):
+def _batch_fit(step, X, y, name="step"):
     """
-    Train one step on all of X: fit if it has one, otherwise reset (if it can) and partial_fit.
+    Train one step on all of X: fit if it has one, otherwise reset and partial_fit.
 
     Parameters:
     ----------
     - step: a pipeline step
     - X, y: the data and labels
+    - name: str, the step's name, used in the error message
 
     Returns:
     -------
     - None
+
+    Raises:
+    ------
+    - TypeError: if the step has neither fit nor reset. A batch fit must start from nothing, and
+    calling partial_fit on a step that may already hold state would silently add to it.
     """
     if hasattr(step, "fit"):
         _call_with_optional_y(step.fit, X, y)
-    else:
-        if hasattr(step, "reset"):
-            step.reset()
+    elif hasattr(step, "reset"):
+        step.reset()
         _call_with_optional_y(step.partial_fit, X, y)
+    else:
+        raise TypeError("Pipeline step {!r} has neither fit nor reset, so fit cannot start it "
+                        "from scratch. Add one of them, or use partial_fit.".format(name))
 
 
 class StreamingPipeline(Pipeline):
@@ -111,7 +121,8 @@ class StreamingPipeline(Pipeline):
     ----------
     - steps: list of (name, object) tuples. Every transformer needs partial_fit and transform;
     the final step needs partial_fit(X, y) and predict(X). fit is optional: fit(X, y) falls back
-    to reset() and partial_fit for a step that has no fit.
+    to reset() and partial_fit for a step that has no fit, and raises TypeError for a step with
+    neither.
 
     Attributes:
     ----------
@@ -121,7 +132,8 @@ class StreamingPipeline(Pipeline):
 
     Raises:
     ------
-    - TypeError: if a step has no partial_fit, or a transformer has no transform
+    - TypeError: if a step has no partial_fit (an object with only fit cannot learn a stream),
+    or a transformer has no transform
     - ValueError: if the step names are not unique
 
     Complexity:
@@ -135,6 +147,7 @@ class StreamingPipeline(Pipeline):
     only so that y goes to the steps that take it.
     - y reaches a step's fit or partial_fit only if its signature has room for it (a second
     positional parameter, *args, a keyword-only y or **kwargs); otherwise the step gets X alone.
+    - An empty chunk changes nothing: no step sees it.
     - update is a synonym of partial_fit.
     """
 
@@ -144,7 +157,9 @@ class StreamingPipeline(Pipeline):
             raise ValueError("Step names must be unique. Got: {}".format(names))
         for name, step in steps:
             if not hasattr(step, "partial_fit"):
-                raise TypeError("Pipeline step {!r} must implement partial_fit".format(name))
+                raise TypeError("Pipeline step {!r} must implement partial_fit: a streaming "
+                                "pipeline learns one chunk at a time, which fit alone cannot do"
+                                .format(name))
         for name, step in steps[:-1]:
             if not hasattr(step, "transform"):
                 raise TypeError("Pipeline step {!r} must implement transform".format(name))
@@ -180,6 +195,8 @@ class StreamingPipeline(Pipeline):
         - ValueError: if X and y do not match, or a step rejects the chunk
         """
         X, y = check_X_y(X, y)
+        if X.shape[0] == 0:
+            return self
         for _, step in self.steps[:-1]:
             _call_with_optional_y(step.partial_fit, X, y)
             X = step.transform(X)
@@ -204,10 +221,10 @@ class StreamingPipeline(Pipeline):
         """
         if not self.steps:
             return self
-        for _, step in self.steps[:-1]:
-            _batch_fit(step, X, y)
+        for name, step in self.steps[:-1]:
+            _batch_fit(step, X, y, name)
             X = step.transform(X)
-        _batch_fit(self.model, X, y)
+        _batch_fit(self.model, X, y, self.steps[-1][0])
         return self
 
     def fit_transform(self, X, y=None):
@@ -230,9 +247,29 @@ class StreamingPipeline(Pipeline):
         for name, step in self.steps:
             if not hasattr(step, "transform"):
                 raise TypeError("Pipeline step {!r} must implement transform".format(name))
-            _batch_fit(step, X, y)
+            _batch_fit(step, X, y, name)
             X = step.transform(X)
         return X
+
+    def reset(self):
+        """
+        Forget everything every step has learned, so the pipeline can start a new stream.
+
+        Returns:
+        -------
+        - self
+
+        Raises:
+        ------
+        - TypeError: if a step has no reset(). Nothing is reset in that case, so the pipeline is
+        never left half-cleared.
+        """
+        for name, step in self.steps:
+            if not hasattr(step, "reset"):
+                raise TypeError("Pipeline step {!r} has no reset()".format(name))
+        for _, step in self.steps:
+            step.reset()
+        return self
 
     def flush(self):
         """
@@ -303,6 +340,7 @@ def prequential_run(model, chunks, metrics=None, log_every=1):
 
     Note:
     ----
+    - A chunk with no rows is skipped (it still counts in the chunk numbers).
     - Before the first tree exists the model cannot predict. A DecisionTree raises NotFittedError;
     a pipeline whose scaler has not seen data raises numcompute's plain RuntimeError. Both mean
     "not ready yet" and are caught, but only while no tree has been trained: once a tree exists,
@@ -312,6 +350,8 @@ def prequential_run(model, chunks, metrics=None, log_every=1):
     tree = model.model if isinstance(model, StreamingPipeline) else model
     rows_read = 0
     for i, (X_chunk, y_chunk) in enumerate(chunks, start=1):
+        if len(y_chunk) == 0:                  # nothing to score or learn from
+            continue
         rows_read += len(y_chunk)
         y_pred = None
         try:

@@ -18,6 +18,8 @@ from numcompute_stream import (ColumnStats, DecisionTree, DecisionTreeClassifier
                                OneHotEncoder, Pipeline, StandardScaler, StreamingAUC,
                                StreamingHistogram, StreamingMetrics, StreamingOneHotEncoder,
                                StreamingQuantiles, StreamTrainer)
+from numcompute_stream import (StreamingImputer, StreamingMinMaxScaler, StreamingPipeline,
+                               StreamingStandardScaler)
 from numcompute_stream.stream import StreamTrainer as StreamTrainerFromModule
 from numcompute_stream.visualise import (compare_models, plot_metric_over_time,
                                          plot_predictions_vs_ground_truth)
@@ -527,3 +529,74 @@ def test_show_option_calls_plt_show(monkeypatch):
     plot_predictions_vs_ground_truth([0, 1], [0, 1], show=True)
     plot_metric_over_time([1, 2])
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------------
+# Review fixes: copies, and an empty chunk changes nothing in any component
+# ---------------------------------------------------------------------
+
+def test_quantiles_hold_their_own_copy_of_a_chunk():
+    chunk = np.array([[1.0], [2.0], [3.0]])
+    sq = StreamingQuantiles().update(chunk)
+    chunk[:] = 100.0                                  # the caller reuses its array
+    assert sq.median()[0] == 2.0
+
+
+def test_trimming_the_window_releases_the_trimmed_rows_memory():
+    sq = StreamingQuantiles(window=10)
+    sq.update(np.arange(1000.0).reshape(-1, 1))
+    assert sq.n_rows_ == 10
+    # a view would keep all 8,000 bytes of the original chunk alive through its base array
+    assert all(c.base is None for c in sq._chunks)
+    assert sum(c.nbytes for c in sq._chunks) == 10 * 8
+    assert sq.median()[0] == 994.5
+
+
+_X_A = np.arange(12.0).reshape(4, 3)
+_X_B = np.arange(12.0, 24.0).reshape(4, 3) ** 1.1
+_Y_A, _Y_B = np.array([0, 1, 0, 1]), np.array([1, 1, 0, 0])
+_EMPTY_X, _EMPTY_Y = np.empty((0, 3)), np.empty(0, dtype=int)
+
+_EMPTY_CASES = {
+    "ColumnStats": (ColumnStats, lambda o, X, y: o.update(X), lambda o: o.summary()),
+    "StreamingQuantiles": (lambda: StreamingQuantiles(window=6), lambda o, X, y: o.update(X),
+                           lambda o: o.quantile([0.1, 0.5, 0.9])),
+    "StreamingHistogram": (lambda: StreamingHistogram(bins=4, value_range=(0, 40)),
+                           lambda o, X, y: o.update(X), lambda o: (o.counts_, o.n_outside_)),
+    "StreamingMetrics": (lambda: StreamingMetrics(window=2),
+                         lambda o, X, y: o.update(y, y[::-1]),
+                         lambda o: (o.result(), o.history["chunk"])),
+    "StreamingAUC": (StreamingAUC, lambda o, X, y: o.update(y, np.where(y == 1, 0.7, 0.3)),
+                     lambda o: o.result()),
+    "DecisionTree": (lambda: DecisionTree(buffer_size=8, max_depth=3),
+                     lambda o, X, y: o.partial_fit(X, y),
+                     lambda o: (o.n_buffered_, o.n_retrains_, o.predict(_X_B))),
+    "StreamingStandardScaler": (StreamingStandardScaler, lambda o, X, y: o.partial_fit(X),
+                                lambda o: o.transform(_X_B)),
+    "StreamingMinMaxScaler": (StreamingMinMaxScaler, lambda o, X, y: o.partial_fit(X),
+                              lambda o: o.transform(_X_B)),
+    "StreamingImputer": (StreamingImputer, lambda o, X, y: o.partial_fit(X),
+                         lambda o: o.transform(_X_B)),
+    "StreamingPipeline": (lambda: StreamingPipeline([("imp", StreamingImputer()),
+                                                     ("tree", DecisionTree(buffer_size=8))]),
+                          lambda o, X, y: o.partial_fit(X, y), lambda o: o.predict(_X_B)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_EMPTY_CASES))
+def test_an_empty_chunk_changes_nothing(name):
+    make, feed, observe = _EMPTY_CASES[name]
+    with_empty, without = make(), make()
+    feed(with_empty, _X_A, _Y_A)
+    feed(with_empty, _EMPTY_X, _EMPTY_Y)
+    feed(with_empty, _X_B, _Y_B)
+    feed(without, _X_A, _Y_A)
+    feed(without, _X_B, _Y_B)
+    a, b = observe(with_empty), observe(without)
+    np.testing.assert_equal(a, b)
+
+
+def test_an_empty_first_chunk_leaves_the_pipeline_untrained():
+    pipe = StreamingPipeline([("imp", StreamingImputer()), ("tree", DecisionTree(buffer_size=8))])
+    pipe.partial_fit(_EMPTY_X, _EMPTY_Y)
+    assert not pipe.model.is_fitted and pipe.model.n_buffered_ == 0
