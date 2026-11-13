@@ -607,3 +607,46 @@ def test_plot_errors_are_informative(call, error, message):
     with pytest.raises(error, match=message):
         call()
     plt.close("all")
+
+
+# ---------------------------------------------------------------------
+# Second review: labels go only to a parameter named y; an empty step list is an error
+# ---------------------------------------------------------------------
+
+def test_a_second_parameter_not_named_y_never_receives_the_labels(blobs):
+    X, y = blobs
+
+    class CopyFlag:
+        def partial_fit(self, X, copy=True):
+            self.copy = copy
+            return self
+
+        def transform(self, X):
+            return X
+
+    step = CopyFlag()
+    StreamingPipeline([("c", step), ("tree", DecisionTree(buffer_size=50))]).partial_fit(X[:50],
+                                                                                         y[:50])
+    assert step.copy is True
+
+
+def test_a_positional_only_y_is_passed_by_position(blobs):
+    X, y = blobs
+    seen = []
+
+    class PositionalOnly:
+        def partial_fit(self, X, y, /):
+            seen.append(y)
+            return self
+
+        def transform(self, X):
+            return X
+
+    StreamingPipeline([("p", PositionalOnly()),
+                       ("tree", DecisionTree(buffer_size=50))]).partial_fit(X[:50], y[:50])
+    np.testing.assert_array_equal(seen[0], y[:50])
+
+
+def test_an_empty_pipeline_is_rejected_with_a_clear_message():
+    with pytest.raises(ValueError, match="at least one step"):
+        StreamingPipeline([])

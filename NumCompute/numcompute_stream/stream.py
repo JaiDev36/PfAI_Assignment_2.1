@@ -102,8 +102,14 @@ class StreamTrainer:
         Raises:
         ------
         - ValueError: if X and y do not match, or the model rejects the chunk
+
+        Note:
+        ----
+        - An empty chunk changes nothing: the model is not called and no log entry is added.
         """
         X, y = check_X_y(X, y)
+        if X.shape[0] == 0:
+            return self
         start = time.perf_counter()
         self.model.partial_fit(X, y)
         seconds = time.perf_counter() - start
@@ -132,14 +138,16 @@ class StreamTrainer:
 
         Returns:
         -------
-        - float, the accuracy on this chunk, or None if the model cannot predict yet (no tree
-        has been trained); nothing is recorded in that case
+        - float, the accuracy on this chunk, or None if the chunk is empty or the model cannot
+        predict yet (no tree has been trained); nothing is recorded in either case
 
         Raises:
         ------
         - ValueError: if X and y do not match
         """
         X, y = check_X_y(X, y)
+        if X.shape[0] == 0:                    # no rows: no accuracy, and the metrics are untouched
+            return None
         try:
             y_pred = self.model.predict(X)
         except NotFittedError:
@@ -163,6 +171,10 @@ class StreamTrainer:
         Returns:
         -------
         - self
+
+        Note:
+        ----
+        - An empty chunk is skipped: it is neither scored nor logged.
         """
         for X_chunk, y_chunk in chunks:
             self.score_chunk(X_chunk, y_chunk)

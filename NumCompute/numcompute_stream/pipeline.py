@@ -41,11 +41,14 @@ def _accepts_y(method):
 
     Returns:
     -------
-    - "positional" if it can be called as method(X, y), "keyword" if only as method(X, y=y),
-    or None if it takes X alone
+    - "positional" to call method(X, y), "keyword" to call method(X, y=y), or None to call
+    method(X)
 
     Note:
     ----
+    - The labels go only to a parameter named y (the convention of numcompute and
+    scikit-learn), or to *args / **kwargs. A second parameter with another name, such as
+    partial_fit(X, copy=True), is left alone, so it never receives the labels by mistake.
     - A method whose signature cannot be read (some built-ins) is assumed to take y, which is
     what numcompute.pipeline.Pipeline always assumed.
     """
@@ -53,11 +56,13 @@ def _accepts_y(method):
         params = list(inspect.signature(method).parameters.values())
     except (TypeError, ValueError):
         return "positional"
-    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-    if len(positional) >= 2 or any(p.kind == p.VAR_POSITIONAL for p in params):
+    for i, p in enumerate(params):
+        if p.name == "y" and p.kind != p.VAR_POSITIONAL and p.kind != p.VAR_KEYWORD:
+            # a positional-only y can only be passed by position (it is the second parameter)
+            return "positional" if p.kind == p.POSITIONAL_ONLY and i == 1 else "keyword"
+    if any(p.kind == p.VAR_POSITIONAL for p in params):
         return "positional"
-    if any(p.kind == p.VAR_KEYWORD or (p.kind == p.KEYWORD_ONLY and p.name == "y")
-           for p in params):
+    if any(p.kind == p.VAR_KEYWORD for p in params):
         return "keyword"
     return None
 
@@ -134,7 +139,7 @@ class StreamingPipeline(Pipeline):
     ------
     - TypeError: if a step has no partial_fit (an object with only fit cannot learn a stream),
     or a transformer has no transform
-    - ValueError: if the step names are not unique
+    - ValueError: if there are no steps, or the step names are not unique
 
     Complexity:
     ----------
@@ -152,6 +157,8 @@ class StreamingPipeline(Pipeline):
     """
 
     def __init__(self, steps):
+        if not steps:
+            raise ValueError("A pipeline needs at least one step (the model). Got no steps.")
         names = [name for name, _ in steps]
         if len(set(names)) != len(names):
             raise ValueError("Step names must be unique. Got: {}".format(names))
