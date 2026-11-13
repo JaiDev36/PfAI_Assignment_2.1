@@ -1,12 +1,14 @@
 """numcompute_stream.tree: impurity, split search, batch training, prediction and bad input."""
 
+import tracemalloc
+
 import numpy as np
 import pytest
 
 from numcompute.pipeline import Estimator, Pipeline
 from numcompute_stream import DecisionTree, NotFittedError
-from numcompute_stream.tree import (best_split_loop, best_split_vectorised, entropy_from_counts,
-                                    gini_from_counts)
+from numcompute_stream.tree import (_midpoint, best_split_loop, best_split_vectorised,
+                                    entropy_from_counts, gini_from_counts)
 
 
 # ---------------------------------------------------------------------
@@ -279,3 +281,64 @@ def test_fit_without_labels_and_none_input():
 def test_invalid_hyperparameters_raise(kwargs):
     with pytest.raises((ValueError, TypeError)):
         DecisionTree(**kwargs)
+
+
+# ---------------------------------------------------------------------
+# Review fixes: the buffer owns its data, and values near the float limit do not overflow
+# ---------------------------------------------------------------------
+
+def test_buffered_rows_are_copies_of_the_callers_arrays():
+    X = np.array([[0.0], [1.0], [2.0], [3.0]])
+    y = np.array([0, 0, 1, 1])
+    tree = DecisionTree(buffer_size=8, max_depth=2).partial_fit(X, y)
+    X[:] = 99.0                                   # the caller reuses its read buffers
+    y[:] = 1
+    tree.flush()
+    assert tree.predict([[0.0], [3.0]]).tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("lo, hi", [
+    (-1.7e308, 1.7e308), (0.8e308, 1.7e308), (-1.7e308, -0.8e308),
+    (1.0, np.nextafter(1.0, 2.0)), (5e-324, 1e-323), (0.0, 5e-324), (-3.0, 7.0),
+])
+def test_midpoint_never_overflows_and_always_separates_the_neighbours(lo, hi):
+    t = _midpoint(np.float64(lo), np.float64(hi))     # a warning here would be an error
+    assert np.isfinite(t) and lo <= t < hi
+
+
+def test_tree_trains_on_values_near_the_float_limit():
+    big = 1.7e308
+    X = np.array([[-big], [-big / 2], [big / 2], [big]])
+    tree = DecisionTree(buffer_size=4, max_depth=2).partial_fit(X, [0, 0, 1, 1])
+    assert tree.predict(X).tolist() == [0, 0, 1, 1]
+    assert np.isfinite(tree.fill_values_).all()
+
+
+def test_nan_fill_mean_is_finite_when_the_sum_would_overflow():
+    big = 1.7e308
+    X = np.array([[big, 1.0], [big, 2.0], [np.nan, 3.0], [big, np.nan]])
+    tree = DecisionTree(buffer_size=4).partial_fit(X, [0, 0, 1, 1])
+    np.testing.assert_allclose(tree.fill_values_, [big, 2.0], rtol=1e-12)
+
+
+def test_nan_fill_mean_matches_nanmean_for_ordinary_data(rng):
+    X = rng.normal(5.0, 3.0, (60, 4))
+    X[rng.random(X.shape) < 0.2] = np.nan
+    tree = DecisionTree(buffer_size=60).partial_fit(X, rng.integers(0, 2, 60))
+    np.testing.assert_allclose(tree.fill_values_, np.nanmean(X, axis=0), rtol=1e-12)
+
+
+def test_split_search_peak_memory_stays_near_the_block_size(monkeypatch, rng):
+    """The documented peak is about six block-sized arrays; check it is under eight."""
+    block_elements = 100_000
+    monkeypatch.setattr("numcompute_stream.tree._MAX_BLOCK_ELEMENTS", block_elements)
+    X = rng.normal(size=(500, 400))                       # one block would be 400 * 500 * 3 values
+    y = rng.integers(0, 3, 500)
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        best_split_vectorised(X, y, 3)
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * block_elements * 8                  # bytes; unblocked it would be ~29 MB

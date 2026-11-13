@@ -46,9 +46,11 @@ from ._validation import (NotFittedError, check_array, check_n_features, check_p
                           check_X_y)
 from .preprocessing import LabelEncoder
 
-# Largest temporary array (in float64 elements) the vectorised search builds at once. Features are
-# scored in blocks to stay under it (about 64 MB).
-_MAX_BLOCK_ELEMENTS = 8_000_000
+# Largest (n_samples, features, n_classes) array (in float64 elements) the vectorised search builds
+# at once; features are scored in blocks of at most this many elements. One such array is 12 MB,
+# and the search holds about six of them at the same time (the one-hot rows in sorted order, their
+# cumulative sums, the right-hand counts and the impurity temporaries), so the peak is under 80 MB.
+_MAX_BLOCK_ELEMENTS = 1_500_000
 
 # A split must beat the best gain so far by more than this, so rounding noise cannot change which
 # of two equally good splits wins.
@@ -121,8 +123,37 @@ CRITERIA = {"gini": gini_from_counts, "entropy": entropy_from_counts}
 
 def _midpoint(lo, hi):
     """Threshold between two distinct neighbours lo < hi, always satisfying lo <= t < hi."""
-    t = lo + (hi - lo) / 2.0
+    t = lo / 2.0 + hi / 2.0               # halving first: hi - lo overflows for lo=-1e308, hi=1e308
     return t if lo <= t < hi else lo      # adjacent floats: the midpoint can round up to hi
+
+
+def _observed_means(X, observed):
+    """
+    Mean of the non-NaN values of each column (0 where a column is all NaN), without overflow.
+
+    Parameters:
+    ----------
+    - X: np.ndarray of shape (n_samples, n_features), finite or NaN
+    - observed: np.ndarray of bool, the same shape, True where X is not NaN
+
+    Returns:
+    -------
+    - np.ndarray of shape (n_features,)
+
+    Note:
+    ----
+    - The plain sum / count is used first, so ordinary data gives the same bits as before. A
+    column whose sum overflows (values near 1e308) is redone as the sum of value / count, which
+    never exceeds the largest value.
+    """
+    counts = observed.sum(axis=0)
+    values = np.where(observed, X, 0.0)
+    with np.errstate(over="ignore", invalid="ignore"):
+        means = np.divide(values.sum(axis=0), counts, out=np.zeros(X.shape[1]), where=counts > 0)
+    bad = ~np.isfinite(means)
+    if bad.any():
+        means[bad] = (values[:, bad] / counts[bad]).sum(axis=0)
+    return means
 
 
 def best_split_vectorised(X, y_codes, n_classes, criterion="gini", min_samples_leaf=1):
@@ -457,6 +488,8 @@ class DecisionTree(Estimator):
         Note:
         ----
         - An empty chunk changes nothing.
+        - The buffer holds its own copy of the chunk, so changing the caller's arrays afterwards
+        (a reused read buffer, say) cannot change what the next tree is trained on.
         - The buffer is cleared after every retrain, so each tree is trained on the rows that
         arrived since the previous one (a window), not on the whole stream.
         """
@@ -467,8 +500,8 @@ class DecisionTree(Estimator):
             self.n_features_in_ = X.shape[1]
         check_n_features(X, self.n_features_in_)
         self._encoder.partial_fit(y)
-        self._buffer_X.append(X)
-        self._buffer_y.append(y)
+        self._buffer_X.append(X.copy())
+        self._buffer_y.append(y.copy())
         self.n_buffered_ += X.shape[0]
         if self.n_buffered_ >= self.buffer_size:
             self._retrain_from_buffer()
@@ -530,10 +563,8 @@ class DecisionTree(Estimator):
     def _train(self, X, y):
         start = time.perf_counter()
         observed = ~np.isnan(X)
-        counts = observed.sum(axis=0)
-        sums = np.where(observed, X, 0.0).sum(axis=0)
         # mean of the observed values of each feature; 0 where the whole column is NaN
-        self.fill_values_ = np.divide(sums, counts, out=np.zeros(X.shape[1]), where=counts > 0)
+        self.fill_values_ = _observed_means(X, observed)
         X = np.where(observed, X, self.fill_values_)
 
         codes = self._encoder.transform(y)
