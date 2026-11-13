@@ -10,6 +10,7 @@ Two questions, answered with numcompute.benchmarking:
    (compare_loop_vs_vectorised raises otherwise), then the median time of several runs is reported.
 2) The effect of buffer_size: the tree is run over data/stream_data.csv (6000 rows, concept drift
    at row 3000) in chunks of 100 rows with test-then-train evaluation, for several buffer sizes.
+   Each size is run once over the stream, so its times are single measurements.
 
 Run from the NumCompute folder:
 
@@ -21,7 +22,9 @@ A full run also saves the figures to benchmark/stream_figures/.
 Reproducibility:
 - every random input comes from a fixed seed (SEED below) and the stream file is generated from a
   fixed seed too
-- each timing is the median of REPEATS runs after one warm-up run
+- each speed timing is the median of REPEATS runs after one warm-up run; the buffer_size sweep
+  runs each size once (its "Mean retrain" is the mean of the per-retrain times the tree records
+  itself, and "Total time" is the wall-clock time of the whole test-then-train run)
 - Python, NumPy and platform versions are printed with the results
 """
 
@@ -144,7 +147,8 @@ def bench_speed(quick):
 
 def bench_buffer(X, y, sizes):
     """
-    For each buffer size: overall and post-drift accuracy, retrain count and retrain cost.
+    For each buffer size: overall accuracy, accuracy just after the drift and after it, retrain
+    count and retrain cost.
 
     Returns a list of dicts and a dict of {buffer_size: metrics history}.
     """
@@ -158,12 +162,15 @@ def bench_buffer(X, y, sizes):
         wall = time.perf_counter() - start
         history = scored.history
         first_row = np.array(history["stream_chunk"]) * CHUNK - CHUNK
-        after = (first_row >= DRIFT_AT) & (first_row < DRIFT_AT + 1000)
+        chunk_acc = np.array(history["chunk_accuracy"])
+        just_after = (first_row >= DRIFT_AT) & (first_row < DRIFT_AT + 1000)
+        all_after = first_row >= DRIFT_AT
         log = pipe.model.retrain_log_
         results.append({
             "buffer_size": size,
             "accuracy": scored.accuracy,
-            "post_drift": float(np.mean(np.array(history["chunk_accuracy"])[after])),
+            "post_drift": float(np.mean(chunk_acc[just_after])),
+            "all_post_drift": float(np.mean(chunk_acc[all_after])),
             "retrains": len(log),
             "mean_retrain": float(np.mean([e["seconds"] for e in log])),
             "wall": wall,
@@ -232,14 +239,22 @@ def main():
     sizes = [100, 500, 2000] if args.quick else BUFFER_SIZES
     results, histories = bench_buffer(X, y, sizes)
     print("Stream: data/stream_data.csv, {:,} rows in chunks of {}, concept drift at row {}. "
-          "Test-then-train, tree max_depth=6.\n".format(len(y), CHUNK, DRIFT_AT))
-    print("| buffer_size | Accuracy | Accuracy in the 1000 rows after the drift | Retrains "
-          "| Mean retrain | Total time |")
-    print("|---|---|---|---|---|---|")
+          "Test-then-train, tree max_depth=6, min_samples_leaf=5.\n"
+          .format(len(y), CHUNK, DRIFT_AT))
+    print("| buffer_size | Accuracy, all scored rows | Rows {0}-{1} (just after the drift) "
+          "| Rows {0}-{2} (all after the drift) | Retrains | Mean retrain | Total time |"
+          .format(DRIFT_AT, DRIFT_AT + 999, len(y) - 1))
+    print("|---|---|---|---|---|---|---|")
     for r in results:
-        print("| {} | {:.3f} | {:.3f} | {} | {} | {} |".format(
-            r["buffer_size"], r["accuracy"], r["post_drift"], r["retrains"],
-            fmt_time(r["mean_retrain"]), fmt_time(r["wall"])))
+        print("| {} | {:.3f} | {:.3f} | {:.3f} | {} | {} | {} |".format(
+            r["buffer_size"], r["accuracy"], r["post_drift"], r["all_post_drift"],
+            r["retrains"], fmt_time(r["mean_retrain"]), fmt_time(r["wall"])))
+    print("\nHow the times were taken: each buffer size is one run over the stream (not a median). "
+          "Mean retrain is the average of the seconds the tree logs for each retrain, and Total "
+          "time is the wall-clock time of the whole test-then-train run, including prediction "
+          "and scoring. Each accuracy is the share of rows predicted correctly in the stated "
+          "range (every chunk has {} rows, so a range is a whole number of chunks)."
+          .format(CHUNK))
     print("\nChunks that arrive before the first tree exists are used for training but are not "
           "scored, so a larger buffer_size scores fewer rows (the first scored row is "
           "{}).".format(", ".join("{} for {}".format(r["first_scored_row"], r["buffer_size"])

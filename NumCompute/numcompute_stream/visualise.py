@@ -239,9 +239,10 @@ def plot_buffer_tradeoff(buffer_sizes, accuracy, retrain_seconds, n_retrains=Non
                   color=PALETTE[1])
     ax_right.set_ylabel("mean retrain time (ms)", color=PALETTE[1])
     if n_retrains is not None:
-        for b, a, r in zip(buffer_sizes, accuracy, n_retrains):
+        ax.margins(x=0.08, y=0.2)             # room for the labels above the top point
+        for i, (b, a, r) in enumerate(zip(buffer_sizes, accuracy, n_retrains)):
             ax.annotate("{} retrains".format(r), (b, a), textcoords="offset points",
-                        xytext=(0, 8), ha="center", fontsize=8, color="#55627a")
+                        xytext=(0, 8 + 11 * (i % 2)), ha="center", fontsize=8, color="#55627a")
     ax.set_title(title)
     ax.grid(alpha=0.3)
     fig.tight_layout()
