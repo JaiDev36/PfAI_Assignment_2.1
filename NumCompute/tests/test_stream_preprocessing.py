@@ -5,10 +5,13 @@ transformers (same inputs, same error messages), run against the streaming class
 what is new: learning chunk by chunk gives the same answer as learning from all the data at once.
 """
 
+from decimal import Decimal, getcontext
+
 import numpy as np
 import pytest
 
 from numcompute import preprocessing
+from numcompute.stats import RunningStats
 from numcompute_stream import (ColumnStats, LabelEncoder, NotFittedError, StreamingImputer,
                                StreamingMinMaxScaler, StreamingStandardScaler, iter_chunks)
 
@@ -295,3 +298,118 @@ def test_label_encoder_errors():
         LabelEncoder().partial_fit([[0, 1], [1, 0]])
     with pytest.raises(ValueError, match="NaN"):
         LabelEncoder().partial_fit([0.0, np.nan])
+
+
+# ---------------------------------------------------------------------
+# Review fixes: ColumnStats near the float limit, and the imputer against batch
+# ---------------------------------------------------------------------
+
+def _exact_mean_std(values, ddof):
+    """Mean and standard deviation by exact decimal arithmetic (no overflow, no rounding)."""
+    getcontext().prec = 60
+    d = [Decimal(float(v)) for v in values]
+    mean = sum(d) / len(d)
+    var = sum((v - mean) ** 2 for v in d) / (len(d) - ddof)
+    return float(mean), float(var.sqrt())
+
+
+@pytest.mark.parametrize("chunks", [1, 2, 4])
+def test_column_stats_mean_and_std_are_exact_for_values_near_the_float_limit(chunks):
+    big = 1.7e308
+    data = np.array([[big, 1.0], [-big, 2.0], [big, 3.0], [big / 2, 4.0]])
+    cs = ColumnStats(ddof=1)
+    for part in np.array_split(data, chunks):            # a warning here would be an error
+        cs.update(part)
+    mean, std = _exact_mean_std(data[:, 0], ddof=1)
+    assert cs.mean[0] == pytest.approx(mean, rel=1e-12)
+    assert cs.std[0] == pytest.approx(std, rel=1e-12)
+    assert cs.min[0] == -big and cs.max[0] == big
+    np.testing.assert_allclose([cs.mean[1], cs.std[1]], [2.5, np.std([1, 2, 3, 4], ddof=1)])
+
+
+def test_column_stats_variance_is_infinity_only_when_the_true_variance_is_out_of_range():
+    big = 1.7e308
+    cs = ColumnStats().update([[big], [-big]])
+    assert np.isinf(cs.var[0])                           # 2.9e616 cannot be a float64
+    assert cs.std[0] == pytest.approx(big, rel=1e-12)    # but the standard deviation can
+
+
+def test_column_stats_do_not_depend_on_the_order_of_huge_and_small_chunks():
+    big = np.full((3, 1), 1.5e308) * np.array([[1.0], [-1.0], [0.5]])
+    small = np.array([[1.0], [2.0], [3.0]])
+    a = ColumnStats().update(big).update(small)
+    b = ColumnStats().update(small).update(big)
+    np.testing.assert_allclose([a.mean[0], a.std[0]], [b.mean[0], b.std[0]], rtol=1e-12)
+    mean, std = _exact_mean_std(np.vstack([big, small])[:, 0], ddof=0)
+    assert a.mean[0] == pytest.approx(mean, rel=1e-12)
+    assert a.std[0] == pytest.approx(std, rel=1e-12)
+
+
+def test_column_stats_give_bit_identical_results_to_running_stats_for_ordinary_data(rng):
+    data = rng.normal(1e6, 50.0, (500, 3))
+    cs = ColumnStats()
+    reference = [RunningStats() for _ in range(3)]
+    for part in np.array_split(data, 7):
+        cs.update(part)
+        for j, ref in enumerate(reference):
+            ref.update(part[:, j])
+    np.testing.assert_array_equal(cs.mean, [r.mean for r in reference])
+    np.testing.assert_array_equal(cs.var, [r.variance() for r in reference])
+    np.testing.assert_array_equal(cs.std, [r.std() for r in reference])
+
+
+def test_scaled_running_stats_merge_matches_one_pass():
+    from numcompute_stream.stats import _ScaledRunningStats
+    big = np.array([1.6e308, -1.6e308, 0.9e308])
+    small = np.array([1.0, 2.0])
+    merged = _ScaledRunningStats().update(big).merge(_ScaledRunningStats().update(small))
+    one_pass = _ScaledRunningStats().update(np.concatenate([big, small]))
+    assert merged.mean == pytest.approx(one_pass.mean, rel=1e-12)
+    assert merged.std() == pytest.approx(one_pass.std(), rel=1e-12)
+    plain = _ScaledRunningStats().merge(RunningStats().update(small))      # a plain RunningStats
+    assert plain.mean == 1.5 and plain.count == 2
+
+
+def test_imputer_streaming_equals_batch_for_any_chunking(rng):
+    X = rng.normal(10.0, 4.0, (240, 3))
+    X[rng.random(X.shape) < 0.15] = np.nan
+    batch = StreamingImputer().fit(X).transform(X)
+    for size in (1, 7, 60, 240):
+        stream = StreamingImputer()
+        for chunk, _ in iter_chunks(X, np.zeros(240), size):
+            stream.partial_fit(chunk)
+        np.testing.assert_allclose(stream.transform(X), batch, rtol=1e-10)
+
+
+@pytest.mark.parametrize("chunks", [1, 2, 4])
+def test_streaming_scaler_matches_the_batch_scaler_near_the_float_limit(chunks):
+    big = 1.7e308
+    X = np.array([[big, 1.0], [big / 2, 2.0], [big / 3, 3.0], [big / 4, 4.0]])
+    stream = StreamingStandardScaler()
+    for part in np.array_split(X, chunks):
+        stream.partial_fit(part)
+    batch = preprocessing.StandardScaler().fit(X)
+    np.testing.assert_allclose(stream.transform(X), batch.transform(X), rtol=1e-10)
+
+
+@pytest.mark.parametrize("call, error", [
+    (lambda rs: rs.update(["a", "b"]), "must be numeric"),
+    (lambda rs: rs.update([1.0, np.inf]), "must be finite"),
+    (lambda rs: rs.merge([1.0, 2.0]), "Can only merge another RunningStats"),
+    (lambda rs: rs.variance(-1), "non-negative integer"),
+    (lambda rs: rs.std(1.5), "non-negative integer"),
+])
+def test_scaled_running_stats_reject_what_running_stats_rejects(call, error):
+    from numcompute_stream.stats import _ScaledRunningStats
+    for cls in (RunningStats, _ScaledRunningStats):
+        with pytest.raises(ValueError, match=error):
+            call(cls())
+
+
+def test_scaled_running_stats_before_enough_data_report_nan_like_running_stats():
+    from numcompute_stream.stats import _ScaledRunningStats
+    rs = _ScaledRunningStats()
+    assert np.isnan(rs.mean) and np.isnan(rs.variance()) and np.isnan(rs.std())
+    rs.update([5.0])
+    assert rs.mean == 5.0 and rs.variance() == 0.0
+    assert np.isnan(rs.variance(1)) and np.isnan(rs.std(1))

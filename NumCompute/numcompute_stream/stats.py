@@ -9,6 +9,7 @@ ColumnStats provides: it keeps one RunningStats per column, so Welford's paralle
 skipping and the infinity check all stay in one place.
 """
 
+import math
 from collections import deque
 
 import numpy as np
@@ -20,6 +21,99 @@ from ._validation import NotFittedError, check_array, check_n_features, check_po
 # Also in this module: StreamingQuantiles (quantiles over a sliding window of rows) and
 # StreamingHistogram (per-feature histograms, optionally over a sliding window of chunks). All
 # three classes have update_stats(X_chunk), a synonym of update.
+
+# Values larger than 2**_SAFE_EXP in size are stored scaled down (see _ScaledRunningStats): their
+# squares, at most 2**(2 * _SAFE_EXP) = 2**800, and the sums of those squares stay far below the
+# largest float, 2**1024.
+_SAFE_EXP = 400
+
+
+def _ldexp(x, e):
+    """x * 2**e as a float, +-inf (not an exception) if the result is too large."""
+    try:
+        return math.ldexp(x, e)
+    except OverflowError:
+        return math.copysign(math.inf, x)
+
+
+class _ScaledRunningStats(RunningStats):
+    """
+    RunningStats that cannot overflow for values up to the largest float.
+
+    The inherited Welford/Chan update squares deviations, so data near 1e308 gives an infinite
+    mean or variance even though every value is finite. This subclass keeps the mean and the sum
+    of squared deviations in units of 2**exp, where exp is raised (never lowered) only when a
+    chunk holds values larger than 2**400. Ordinary data therefore has exp = 0 and gives exactly
+    the numbers RunningStats gives. count, min and max are not scaled.
+
+    Note:
+    ----
+    - mean and std are finite whenever the data are. variance is infinity when the true variance
+    is larger than the largest float (for example values of +-1e308), as the true value is not
+    representable; std still reports the correct finite number.
+    - The scale is a power of two, so rescaling is exact (apart from numbers so small that they
+    are negligible next to the scale).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._exp = 0
+
+    def update(self, values):
+        batch = np.asarray(values)
+        if batch.dtype.kind not in "biuf":
+            raise ValueError("values must be numeric. Got dtype: {}".format(batch.dtype))
+        batch = batch.astype(np.float64).ravel()
+        batch = batch[~np.isnan(batch)]
+        if not np.isfinite(batch).all():
+            raise ValueError("values must be finite (NaN values are skipped).")
+        if batch.size == 0:
+            return self
+        exp_b = max(0, math.frexp(float(np.abs(batch).max()))[1] - _SAFE_EXP)
+        scaled = np.ldexp(batch, -exp_b)
+        mean_b = scaled.mean()
+        m2_b = float(np.sum((scaled - mean_b) ** 2))
+        self._absorb(batch.size, float(mean_b), m2_b, float(batch.min()), float(batch.max()), exp_b)
+        return self
+
+    def merge(self, other):
+        if not isinstance(other, RunningStats):
+            raise ValueError("Can only merge another RunningStats.")
+        if other._count > 0:
+            self._absorb(other._count, other._mean, other._m2, other._min, other._max,
+                         getattr(other, "_exp", 0))
+        return self
+
+    def _absorb(self, n_b, mean_b, m2_b, min_b, max_b, exp_b):
+        """Merge a batch held in units of 2**exp_b, after bringing both sides to one scale."""
+        exp = max(self._exp, exp_b)
+        if exp > self._exp:
+            drop = exp - self._exp
+            self._mean = _ldexp(self._mean, -drop)
+            self._m2 = _ldexp(self._m2, -2 * drop)
+            self._exp = exp
+        if exp > exp_b:
+            drop = exp - exp_b
+            mean_b = _ldexp(mean_b, -drop)
+            m2_b = _ldexp(m2_b, -2 * drop)
+        self._combine(n_b, mean_b, m2_b, min_b, max_b)
+
+    @property
+    def mean(self):
+        return _ldexp(float(self._mean), self._exp) if self._count else float("nan")
+
+    def variance(self, ddof=0):
+        if isinstance(ddof, bool) or not isinstance(ddof, (int, np.integer)) or ddof < 0:
+            raise ValueError("ddof must be a non-negative integer. Got: {!r}".format(ddof))
+        if self._count - ddof <= 0:
+            return float("nan")
+        return _ldexp(float(self._m2 / (self._count - ddof)), 2 * self._exp)
+
+    def std(self, ddof=0):
+        self.variance(ddof)                          # the same ddof check and NaN rule
+        if self._count - ddof <= 0:
+            return float("nan")
+        return _ldexp(math.sqrt(self._m2 / (self._count - ddof)), self._exp)
 
 
 class ColumnStats:
@@ -47,6 +141,9 @@ class ColumnStats:
     ----
     - NaN values are skipped per feature, so each feature has its own count.
     - A feature with no observed value yet reports NaN for every statistic.
+    - Each feature is one numcompute.stats.RunningStats with the scale handling of
+    _ScaledRunningStats, so mean and std stay finite even for values near 1e308 (var is
+    infinity if the true variance is beyond the float range).
     - The median is not available: it needs every value seen so far, so it cannot be streamed.
 
     Examples:
@@ -104,7 +201,7 @@ class ColumnStats:
             return self
         if self.n_features_ is None:
             self.n_features_ = X.shape[1]
-            self._cols = [RunningStats() for _ in range(self.n_features_)]
+            self._cols = [_ScaledRunningStats() for _ in range(self.n_features_)]
         check_n_features(X, self.n_features_)
         for j, col in enumerate(self._cols):
             col.update(X[:, j])
@@ -249,7 +346,7 @@ class StreamingQuantiles:
         if self.n_features_ is None:
             self.n_features_ = X.shape[1]
         check_n_features(X, self.n_features_)
-        self._chunks.append(X)
+        self._chunks.append(X.copy())           # own copy: the caller may reuse its array
         self.n_rows_ += X.shape[0]
         self.n_seen_ += X.shape[0]
         if self.window is not None:
@@ -260,7 +357,8 @@ class StreamingQuantiles:
                     self._chunks.popleft()
                     self.n_rows_ -= oldest.shape[0]
                 else:
-                    self._chunks[0] = oldest[excess:]
+                    # a copy, not a view, so the trimmed rows' memory is really released
+                    self._chunks[0] = oldest[excess:].copy()
                     self.n_rows_ -= excess
         return self
 
