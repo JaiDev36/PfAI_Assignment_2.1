@@ -121,8 +121,10 @@ parameters, return value, exceptions, and time and space complexity.
 - **Numerical stability.** `softmax`, `log_softmax` and `logsumexp` subtract the maximum first.
   Quantiles and percentiles interpolate in a form that does not overflow for -1e308 and 1e308.
   Euclidean distance uses `np.hypot`, because the shortcut `|x|² + |y|² - 2x·y` gives 0 for
-  the points 1e9 and 1e9 + 1. `StandardScaler` and `MinMaxScaler` handle values near 1e308.
-  `RunningStats` uses Welford's update.
+  the points 1e9 and 1e9 + 1. `StandardScaler` and `MinMaxScaler` handle values near 1e308 as long
+  as the range of the data fits in a float64 (`x - mean` over 1.8e308 still overflows).
+  `RunningStats` uses Welford's update, which squares deviations and so overflows for values near
+  1e308; `numcompute_stream.ColumnStats` wraps it to avoid that.
 - **Repeatable results.** Sorting is stable, so tied values keep their original order, and random
   steps such as `quickselect` and `batches` take a seed.
 
