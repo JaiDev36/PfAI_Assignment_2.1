@@ -49,7 +49,9 @@ from .preprocessing import LabelEncoder
 # Largest (n_samples, features, n_classes) array (in float64 elements) the vectorised search builds
 # at once; features are scored in blocks of at most this many elements. One such array is 12 MB,
 # and the search holds about six of them at the same time (the one-hot rows in sorted order, their
-# cumulative sums, the right-hand counts and the impurity temporaries), so the peak is under 80 MB.
+# cumulative sums, the right-hand counts and the impurity temporaries). The measured peak was
+# about 77 MB for 2,000 rows, 1,500 features and 3 classes. It is not a hard limit: when one
+# feature alone needs more (n_samples * n_classes > 1.5 million), a block is that one feature.
 _MAX_BLOCK_ELEMENTS = 1_500_000
 
 # A split must beat the best gain so far by more than this, so rounding noise cannot change which
@@ -175,7 +177,8 @@ def best_split_vectorised(X, y_codes, n_classes, criterion="gini", min_samples_l
     Complexity:
     ----------
     - Time complexity: O(d * n log n + d * n * k) for n samples, d features and k classes
-    - Space complexity: O(n * k) per block of features; blocks keep it under about 64 MB
+    - Space complexity: O(n * k) per feature, in blocks of at most _MAX_BLOCK_ELEMENTS values
+    (12 MB per array; about 77 MB peak measured for 2,000 rows, 1,500 features, 3 classes)
 
     Note:
     ----

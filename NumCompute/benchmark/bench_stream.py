@@ -17,7 +17,8 @@ Run from the NumCompute folder:
     python benchmark/bench_stream.py
     python benchmark/bench_stream.py --quick        (smaller sizes, a few seconds)
 
-A full run also saves the figures to benchmark/stream_figures/.
+A full run also writes its output to benchmark/results_stream.md (UTF-8) and saves the figures to
+benchmark/stream_figures/. A --quick run only prints.
 
 Reproducibility:
 - every random input comes from a fixed seed (SEED below) and the stream file is generated from a
@@ -29,6 +30,8 @@ Reproducibility:
 """
 
 import argparse
+import contextlib
+import io
 import os
 import sys
 import time
@@ -118,10 +121,12 @@ def bench_speed(quick):
 
     n = 400 if quick else 800
     X, y = make_data(rng, n)
-    add("tree: training (max_depth=5)", "n={:,}, 5 features".format(n),
+    # fit alone is timed; the two trees are compared through their feature importances, which
+    # are equal only when both splitters grew the same tree
+    add("tree: fit only (max_depth=5)", "n={:,}, 5 features".format(n),
         benchmarking.compare_loop_vs_vectorised(
-            lambda: DecisionTree(max_depth=5, splitter="loop").fit(X, y).predict(X),
-            lambda: DecisionTree(max_depth=5).fit(X, y).predict(X),
+            lambda: DecisionTree(max_depth=5, splitter="loop").fit(X, y).feature_importances_,
+            lambda: DecisionTree(max_depth=5).fit(X, y).feature_importances_,
             repeats=repeats))
 
     X_train, y_train = make_data(rng, 2000)
@@ -180,7 +185,7 @@ def bench_buffer(X, y, sizes):
     return results, histories
 
 
-def save_figures(results, histories, folder):
+def save_figures(results, histories, folder, last_row):
     """Write the buffer-size figures (a full run only)."""
     import matplotlib
     matplotlib.use("Agg")
@@ -188,10 +193,13 @@ def save_figures(results, histories, folder):
     from numcompute_stream import visualise
 
     os.makedirs(folder, exist_ok=True)
+    # accuracy on the same rows for every buffer size (all rows after the drift), so the points
+    # are comparable; the overall accuracy starts at a different row for each size
     fig, _ = visualise.plot_buffer_tradeoff(
-        [r["buffer_size"] for r in results], [r["accuracy"] for r in results],
+        [r["buffer_size"] for r in results], [r["all_post_drift"] for r in results],
         [r["mean_retrain"] for r in results], n_retrains=[r["retrains"] for r in results],
-        title="buffer_size: accuracy against retrain cost")
+        title="buffer_size: accuracy on the same rows against retrain cost",
+        accuracy_label="accuracy, rows {}-{}".format(DRIFT_AT, last_row))
     fig.savefig(os.path.join(folder, "buffer_tradeoff.png"), dpi=130)
 
     fig, ax = plt.subplots(figsize=(9, 4.5))
@@ -214,11 +222,36 @@ def save_figures(results, histories, folder):
 # Report
 # ---------------------------------------------------------------------
 
+class _Tee(io.StringIO):
+    """Keeps a copy of everything printed, and still prints it."""
+
+    def __init__(self, out):
+        super().__init__()
+        self._out = out
+
+    def write(self, text):
+        self._out.write(text)
+        return super().write(text)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("--quick", action="store_true", help="smaller sizes, nothing is saved")
     args = parser.parse_args()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")      # a console without "µ" prints "?" instead
+    tee = _Tee(sys.stdout)
+    with contextlib.redirect_stdout(tee):
+        report(args)
+    if not args.quick:
+        path = os.path.join(HERE, "results_stream.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(tee.getvalue())
+        print("Saved benchmark/results_stream.md")
 
+
+def report(args):
+    """Run both benchmarks and print the results as Markdown."""
     env = benchmarking.environment_info()
     print("## NumCompute-Stream benchmarks\n")
     for key in ("python", "numpy", "platform", "processor"):
@@ -262,7 +295,7 @@ def main():
 
     if not args.quick:
         folder = os.path.join(HERE, "stream_figures")
-        save_figures(results, histories, folder)
+        save_figures(results, histories, folder, len(y) - 1)
         print("\nFigures saved to benchmark/stream_figures/.")
 
 

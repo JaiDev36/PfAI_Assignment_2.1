@@ -204,7 +204,8 @@ def plot_benchmark(sizes, timings, ax=None, logy=True, logx=False, xlabel="numbe
 
 
 def plot_buffer_tradeoff(buffer_sizes, accuracy, retrain_seconds, n_retrains=None,
-                         title="Effect of buffer_size", save_path=None):
+                         title="Effect of buffer_size", save_path=None,
+                         accuracy_label="prequential accuracy"):
     """
     Accuracy (left axis) and mean retrain time (right axis) against buffer_size.
 
@@ -215,6 +216,8 @@ def plot_buffer_tradeoff(buffer_sizes, accuracy, retrain_seconds, n_retrains=Non
     - retrain_seconds: sequence of float, mean seconds per retrain, one per buffer size
     - n_retrains: sequence of int, optional, written above each accuracy point
     - title, save_path: see plot_metric_history
+    - accuracy_label: str, the label of the accuracy axis (say which rows were scored, because a
+    larger buffer starts scoring later)
 
     Returns:
     -------
@@ -233,7 +236,7 @@ def plot_buffer_tradeoff(buffer_sizes, accuracy, retrain_seconds, n_retrains=Non
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(buffer_sizes, accuracy, marker="o", lw=2, color=PALETTE[0])
     ax.set_xlabel("buffer_size")
-    ax.set_ylabel("prequential accuracy", color=PALETTE[0])
+    ax.set_ylabel(accuracy_label, color=PALETTE[0])
     ax_right = ax.twinx()
     ax_right.plot(buffer_sizes, np.asarray(retrain_seconds) * 1000, marker="s", lw=2,
                   color=PALETTE[1])

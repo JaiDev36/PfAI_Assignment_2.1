@@ -10,13 +10,13 @@
 
 | Operation | Input | Python loop | Vectorised | Speed-up |
 |---|---|---|---|---|
-| tree: best-split search | n=200, 5 features | 20.17 ms | 187.2 µs | 107.7x |
-| tree: best-split search | n=400, 5 features | 42.60 ms | 327.1 µs | 130.2x |
-| tree: best-split search | n=800, 5 features | 93.95 ms | 530.3 µs | 177.2x |
-| tree: best-split search | n=1,600, 5 features | 214.45 ms | 1.42 ms | 151.0x |
-| tree: training (max_depth=5) | n=800, 5 features | 401.87 ms | 5.27 ms | 76.2x |
-| tree: predict (depth-8 tree) | n=100,000 | 191.40 ms | 12.04 ms | 15.9x |
-| ColumnStats (chunks of 1000) | n=200,000, 5 features | 89.39 ms | 17.73 ms | 5.0x |
+| tree: best-split search | n=200, 5 features | 20.75 ms | 172.3 µs | 120.5x |
+| tree: best-split search | n=400, 5 features | 42.22 ms | 276.5 µs | 152.7x |
+| tree: best-split search | n=800, 5 features | 95.54 ms | 538.5 µs | 177.4x |
+| tree: best-split search | n=1,600, 5 features | 212.85 ms | 1.37 ms | 155.2x |
+| tree: fit only (max_depth=5) | n=800, 5 features | 391.11 ms | 5.20 ms | 75.2x |
+| tree: predict (depth-8 tree) | n=100,000 | 185.85 ms | 12.70 ms | 14.6x |
+| ColumnStats (chunks of 1000) | n=200,000, 5 features | 88.06 ms | 16.89 ms | 5.2x |
 
 Both versions were checked to give the same answer before timing.
 
@@ -26,12 +26,12 @@ Stream: data/stream_data.csv, 6,000 rows in chunks of 100, concept drift at row 
 
 | buffer_size | Accuracy, all scored rows | Rows 3000-3999 (just after the drift) | Rows 3000-5999 (all after the drift) | Retrains | Mean retrain | Total time |
 |---|---|---|---|---|---|---|
-| 100 | 0.694 | 0.717 | 0.727 | 60 | 1.10 ms | 91.14 ms |
-| 250 | 0.732 | 0.703 | 0.753 | 20 | 3.08 ms | 87.39 ms |
-| 500 | 0.729 | 0.678 | 0.753 | 12 | 4.70 ms | 83.07 ms |
-| 1000 | 0.729 | 0.603 | 0.732 | 6 | 8.36 ms | 77.12 ms |
-| 2000 | 0.713 | 0.619 | 0.700 | 3 | 14.29 ms | 66.20 ms |
-| 3000 | 0.626 | 0.622 | 0.626 | 2 | 19.14 ms | 57.32 ms |
+| 100 | 0.694 | 0.717 | 0.727 | 60 | 1.11 ms | 92.75 ms |
+| 250 | 0.732 | 0.703 | 0.753 | 20 | 2.87 ms | 81.71 ms |
+| 500 | 0.729 | 0.678 | 0.753 | 12 | 4.53 ms | 80.06 ms |
+| 1000 | 0.729 | 0.603 | 0.732 | 6 | 7.56 ms | 69.00 ms |
+| 2000 | 0.713 | 0.619 | 0.700 | 3 | 13.76 ms | 62.82 ms |
+| 3000 | 0.626 | 0.622 | 0.626 | 2 | 19.58 ms | 59.10 ms |
 
 How the times were taken: each buffer size is one run over the stream (not a median). Mean retrain is the average of the seconds the tree logs for each retrain, and Total time is the wall-clock time of the whole test-then-train run, including prediction and scoring. Each accuracy is the share of rows predicted correctly in the stated range (every chunk has 100 rows, so a range is a whole number of chunks).
 
