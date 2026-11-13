@@ -142,7 +142,7 @@ the tree in groups, one comparison per node.
 ## Tests
 
 ```bash
-pytest tests/test_stream_*.py                       # the streaming tests (325)
+pytest tests/test_stream_*.py                       # the streaming tests (342)
 pytest --cov=numcompute_stream --cov-report=term-missing
 ```
 
@@ -156,7 +156,7 @@ training) for several chunk sizes, loop equal to vectorised, when exactly the bu
 retrain, concept drift, NaN, ties, constant columns, a new class mid-stream, bad input, an empty
 chunk for every component, values near 1e308, caller arrays that change after `partial_fit`,
 third-party pipeline steps that take no `y`, and every plot. The whole suite (numcompute's tests
-included, 909 tests) runs with warnings treated as errors.
+included, 926 tests) runs with warnings treated as errors.
 
 ## Benchmarks and demo
 
@@ -171,14 +171,14 @@ figures. On the machine used (Python 3.12, NumPy 2.5.4, Windows 11):
 
 | Operation | Input | Python loop | Vectorised | Speed-up |
 |---|---|---|---|---|
-| best-split search | n=1,600, 5 features | 214 ms | 1.4 ms | 151x |
-| tree training, max_depth=5 | n=800, 5 features | 402 ms | 5.3 ms | 76x |
-| tree prediction | n=100,000 | 191 ms | 12.0 ms | 15.9x |
-| `ColumnStats` | n=200,000, 5 features | 89 ms | 17.7 ms | 5.0x |
+| best-split search | n=1,600, 5 features | 213 ms | 1.4 ms | 155x |
+| tree `fit` only, max_depth=5 | n=800, 5 features | 391 ms | 5.2 ms | 75x |
+| tree prediction | n=100,000 | 186 ms | 12.7 ms | 14.6x |
+| `ColumnStats` | n=200,000, 5 features | 88 ms | 16.9 ms | 5.2x |
 
 `buffer_size` is a trade between how fresh the tree is and how much data it learns from. On the
 drifting stream (chunks of 100 rows), a buffer of 100 gave 0.717 accuracy in the 1000 rows after the
-drift, a buffer of 1000 gave 0.603, and the mean retrain time went from 1.1 ms to 8.4 ms. Over all
+drift, a buffer of 1000 gave 0.603, and the mean retrain time went from 1.1 ms to 7.6 ms. Over all
 3,000 rows after the drift, buffers of 250 and 500 did best (0.753). A tree with a larger buffer
 also scores fewer rows, because nothing is predicted until the first tree exists, so overall
 accuracy is not compared across buffer sizes without that in mind. Each buffer size is one run, so
