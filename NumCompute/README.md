@@ -214,7 +214,7 @@ and extreme magnitudes. GitHub Actions runs the test suite on every pull request
 | Quick benchmark run | `python benchmark/run_all.py --quick` (does not write a file) |
 | Check code style | `flake8` |
 | Open the demo | open `demo/quickstart.ipynb` in VS Code or Jupyter and run all cells |
-| Streaming benchmark (Assignment 2.2) | `python benchmark/bench_stream.py` (also part of `run_all.py`; output in `benchmark/results_stream.md`) |
+| Streaming benchmark (Assignment 2.2) | `python benchmark/bench_stream.py` (writes `benchmark/results_stream.md` and `benchmark/stream_figures/`; also run by `run_all.py`, whose output goes to `results.md`) |
 | Streaming demo (Assignment 2.2) | open `demo/stream_demo.ipynb` (data from `python data/make_stream_data.py`) |
 
 On Windows, use `py` in place of `python` if `python` is not found. Run every command from the `NumCompute` folder (the one that contains `numcompute/`, `tests/`, `benchmark/` and `demo/`).
